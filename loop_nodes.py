@@ -193,7 +193,7 @@ class ViggleSampleChunk:
         predecessor = state["entries"][-1]["key"] if i else ""
         h = hashlib.sha256()
         values = (CHECKPOINT_VERSION, signature, continuation, predecessor, plan["conds"][i], sigmas,
-                  (a, b, lat0, latn), (ch, cw), seed_i)
+                  (a, b, lat0, latn), (ch, cw), seed_i, plan.get("audio_digest", b""))
         if not _hash_cache_value(h, values):
             raise ValueError("Viggle: this conditioning cannot be fingerprinted for checkpoint recovery.")
         key = h.hexdigest()
@@ -212,7 +212,10 @@ class ViggleSampleChunk:
             dev = comfy.model_management.intermediate_device()
             a0, a1 = round(a / FPS * 40), round((b + 1) / FPS * 40)
             v = torch.zeros([1, 24, latn, ch // 16, cw // 16], device=dev)
-            au = torch.zeros([1, 32, 2, a1 - a0], device=dev)
+            # Connected audio rides in as a clean condition, so it needs no carry-over.
+            cond_a = plan.get("audio_latent")
+            au = (cond_a[..., a0:a1].to(device=dev, dtype=torch.float32) if cond_a is not None
+                  else torch.zeros([1, 32, 2, a1 - a0], device=dev))
             previous = state["previous"]
             carry = 0
             if previous is not None:
@@ -227,11 +230,11 @@ class ViggleSampleChunk:
                         v[:, :, :carry] = previous["video"][:, :, lat0 - pstart:lat0 - pstart + carry].to(dev)
                     audio_overlap = max(0, round((pb + 1) / FPS * 40) - a0)
                     audio_offset = a0 - round(pa / FPS * 40)
-                    if audio_overlap:
+                    if audio_overlap and cond_a is None:
                         au[..., :audio_overlap] = previous["audio"][..., audio_offset:audio_offset + audio_overlap].to(dev)
             out_v, out_a = ViggleChunkedSampler()._sample_window(
                 core_sampler.Noise_RandomNoise(seed_i), guider, sampler, sigmas, plan["conds"][i], seed_i,
-                ch, cw, a, b, carry, v, au)
+                ch, cw, a, b, carry, v, au, cond_a is not None)
             out_v, out_a = out_v.detach().cpu().contiguous(), out_a.detach().cpu().contiguous()
             metadata = {"viggle": json.dumps({"version": CHECKPOINT_VERSION, "entry": entry, "canvas": list(plan["canvas"])})}
             tensors = {"latent_tensor": out_v, "audio": out_a, "latent_format_version_0": torch.empty(0)}

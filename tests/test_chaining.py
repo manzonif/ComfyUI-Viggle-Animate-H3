@@ -55,9 +55,9 @@ class ChainingTests(unittest.TestCase):
     def run_key(self):
         return self.node._sampling_key(self.noise, self.guider, self.sampler)
 
-    def chunk_key(self, cond=None, previous=b"", span=(0, 123, 0, 37, 0)):
+    def chunk_key(self, cond=None, previous=b"", span=(0, 123, 0, 37, 0), audio=b""):
         return self.node._chunk_key(previous, self.run_key(), conditioning() if cond is None else cond,
-                                    0, 32, 32, span, self.sigmas)
+                                    0, 32, 32, span, self.sigmas, audio)
 
     def test_basic_and_cfg_preserve_original_conditions(self):
         for guider in (self.guider, comfy.samplers.CFGGuider(self.model)):
@@ -100,6 +100,7 @@ class ChainingTests(unittest.TestCase):
             self.assertNotEqual(original, self.chunk_key(cond))
         self.assertNotEqual(original, self.chunk_key(previous=b"changed"))
         self.assertNotEqual(original, self.chunk_key(span=(17, 140, 5, 37, 7)))
+        self.assertNotEqual(original, self.chunk_key(audio=b"soundtrack"))   # another soundtrack, another chunk
         self.sigmas[1] = 0.8
         self.assertNotEqual(original, self.chunk_key())
 
@@ -228,8 +229,8 @@ class ChainingTests(unittest.TestCase):
         with patch.object(self.node, "_render_chunk", return_value=(torch.zeros(1), torch.zeros(1))), \
              patch.object(viggle, "_chunk_cache_get", return_value=None), \
              patch.object(DecodeVAE, "decode", return_value=pixels) as decode:
-            frames, _ = self.node.sample(self.guider, self.sampler, self.sigmas,
-                                         plan, DecodeVAE(), 10, 0, 0)
+            frames, *_ = self.node.sample(self.guider, self.sampler, self.sigmas,
+                                          plan, DecodeVAE(), 10, 0, 0)
             self.assertTrue(torch.equal(frames, pixels[:20]))
             decode.return_value = pixels[:19]
             with self.assertRaisesRegex(ValueError, "shorter than the source"):
@@ -257,14 +258,14 @@ class ChainingTests(unittest.TestCase):
                 "total_frames": 328, "source_frames": 322, "canvas": (32, 32),
                 "continuation": "five_frame_anchor"}
         calls = []
-        def sample(noise, guider, sampler, sigmas, cond, seed, ch, cw, a, b, carry, v, au):
-            calls.append((seed, carry, v.clone(), au.clone()))
+        def sample(noise, guider, sampler, sigmas, cond, seed, ch, cw, a, b, carry, v, au, au_clean=False):
+            calls.append((seed, carry, v.clone(), au.clone(), au_clean))
             # Deliberately change even overlap values to verify assembly keeps
             # the accepted prefix, including the final window's warm-up region.
             return torch.full_like(v, seed), torch.full_like(au, seed)
 
         with patch.object(self.node, "_sample_window", side_effect=sample):
-            frames, _ = self.node.sample(self.guider, self.sampler, self.sigmas, plan, vae, 10, 0, 0)
+            frames, *_ = self.node.sample(self.guider, self.sampler, self.sigmas, plan, vae, 10, 0, 0)
             self.assertEqual(len(frames), 322)
             self.assertEqual([c[:2] for c in calls], [(10, 0), (11, 2), (12, 2)])
             self.assertTrue(torch.equal(vae.encoded[0][:, 0, 0, 0], torch.arange(119, 124) + 10000))
@@ -272,7 +273,8 @@ class ChainingTests(unittest.TestCase):
             for call, encoded in zip(calls[1:], vae.encoded):
                 self.assertTrue((call[2][:, :, :2] == encoded[0, 0, 0, 0] + 100).all())
                 self.assertEqual(call[2][:, :, 2:].count_nonzero(), 0)
-                self.assertEqual(call[3].count_nonzero(), 0)
+                self.assertEqual(call[3].count_nonzero(), 0)   # nothing fed: the audio rows stay empty
+                self.assertFalse(call[4])                      # ... so they are still generated
             master = vae.decoded[-1]
             self.assertTrue((master[:, :, :37] == 10).all())
             self.assertTrue((master[:, :, 37:72] == 11).all())
@@ -285,6 +287,149 @@ class ChainingTests(unittest.TestCase):
             self.assertTrue((vae.decoded[-1][:, :, 37:72] == 99).all())
             self.node.sample(self.guider, self.sampler, self.sigmas, plan, AnchorVAE(), 10, 0, 0)
             self.assertEqual([c[0] for c in calls[-3:]], [10, 11, 12])
+
+    def audio_grid(self, rows):
+        """Audio latent where every row holds its own index, so slices are checkable by content."""
+        return torch.arange(rows, dtype=torch.float32).view(1, 1, 1, rows).expand(1, 32, 2, rows).contiguous()
+
+    def test_driving_audio_is_sliced_per_window_and_held_clean(self):
+        spans = viggle.plan_spans(200, 124, 22)
+        total_a = round(int(viggle._generation_frame_count(200)) / 24 * 40)
+        audio = self.audio_grid(total_a)
+        cond_set = {"spans": spans, "conds": [conditioning() for _ in spans],
+                    "total_frames": int(viggle._generation_frame_count(200)), "canvas": (32, 32),
+                    "audio_latent": audio, "audio_digest": b"drive"}
+        seen = []
+
+        def fake_sample(guider, noise, samples, sampler, sigmas, denoise_mask=None, **kwargs):
+            video, au = samples.unbind()
+            mask_video, mask_audio = denoise_mask.unbind() if denoise_mask is not None else (None, None)
+            seen.append((au.clone(),
+                         mask_video.clone() if mask_video is not None else None,
+                         mask_audio.clone() if mask_audio is not None else None))
+            return comfy.nested_tensor.NestedTensor([video, au])
+
+        with patch.object(core.Guider_Basic, "sample", fake_sample), \
+             patch.object(comfy.sample, "fix_empty_latent_channels", lambda model, samples: samples), \
+             patch.object(viggle.latent_preview, "prepare_callback", lambda *args: None), \
+             patch.object(viggle, "_send_progress"):
+            frames, report, master_audio = self.node.sample(self.guider, self.sampler, self.sigmas,
+                                                            cond_set, DecodeVAE(), 10, 0, 0)
+
+        self.assertEqual(len(seen), len(spans))
+        for (a, b, _, _), (au, mask_video, mask_audio) in zip(spans, seen):
+            a0, a1 = round(a / 24 * 40), round((b + 1) / 24 * 40)
+            self.assertTrue(torch.equal(au, audio[..., a0:a1]))   # this window's slice of the clip
+            self.assertEqual(mask_audio.amax().item(), 0.0)       # clean audio: never denoised
+            self.assertEqual(mask_video.amax().item(), 1.0)       # video mask untouched by the audio
+        self.assertIn("driving soundtrack held clean", report)
+        self.assertEqual(tuple(master_audio["samples"].shape), (1, 32, 2, total_a))
+
+        # Without audio the rows stay empty and keep the old "generate it" behaviour.
+        cond_set.pop("audio_latent"), cond_set.pop("audio_digest")
+        viggle._CHUNK_CACHE.clear()
+        seen.clear()
+        with patch.object(core.Guider_Basic, "sample", fake_sample), \
+             patch.object(comfy.sample, "fix_empty_latent_channels", lambda model, samples: samples), \
+             patch.object(viggle.latent_preview, "prepare_callback", lambda *args: None), \
+             patch.object(viggle, "_send_progress"):
+            self.node.sample(self.guider, self.sampler, self.sigmas, cond_set, DecodeVAE(), 10, 0, 0)
+        self.assertEqual(seen[0][0].count_nonzero().item(), 0)   # empty rows, nothing to condition on
+        self.assertIsNone(seen[0][1])                            # first chunk: no mask at all, as before
+        self.assertIsNone(seen[0][2])
+        self.assertEqual(seen[1][2].amax().item(), 1.0)          # later chunks still generate their audio
+
+    def test_anchor_windows_receive_their_own_audio_slice(self):
+        spans = viggle.plan_spans(322, 124, 5)
+        total_a = round(328 / 24 * 40)
+        audio = self.audio_grid(total_a)
+        plan = {"spans": spans, "conds": [conditioning() for _ in spans],
+                "total_frames": 328, "canvas": (32, 32), "continuation": "five_frame_anchor",
+                "audio_latent": audio, "audio_digest": b"drive"}
+        calls = []
+
+        def sample(noise, guider, sampler, sigmas, cond, seed, ch, cw, a, b, carry, v, au, au_clean=False):
+            calls.append((a, b, carry, au_clean, au.clone()))
+            return torch.full_like(v, seed), torch.full_like(au, seed)
+
+        anchor = torch.zeros(1, 24, 2, 2, 2)
+        with patch.object(self.node, "_sample_window", side_effect=sample), \
+             patch.object(viggle, "_encode_anchor", return_value=anchor), \
+             patch.object(viggle, "_send_progress"):
+            frames, report, master_audio = self.node.sample(self.guider, self.sampler, self.sigmas,
+                                                            plan, DecodeVAE(), 10, 0, 0)
+
+        self.assertEqual([c[3] for c in calls], [True] * len(spans))
+        for a, b, carry, clean, au in calls:
+            a0, a1 = round(a / 24 * 40), round((b + 1) / 24 * 40)
+            self.assertTrue(torch.equal(au, audio[..., a0:a1]))
+        self.assertEqual(tuple(master_audio["samples"].shape), (1, 32, 2, total_a))
+
+    def test_encode_drive_audio_maps_the_timeline_and_the_rows(self):
+        class FakeAudioVAE:
+            audio_sample_rate = 32000
+
+            def __init__(self, rows):
+                self.rows, self.seen = rows, None
+
+            def encode(self, audio):
+                self.seen = audio.shape                       # [batch, samples, channels]
+                return torch.zeros(1, 32, 1, self.rows)       # mono on purpose
+
+        encode = viggle._encode_drive_audio
+        clip = {"waveform": torch.zeros(1, 1, 32000), "sample_rate": 32000}   # one second, mono
+        vae = FakeAudioVAE(10)
+        z = encode(vae, clip, 24.0, 20)
+        self.assertEqual(vae.seen, (1, 32000, 1))                  # untouched when the clip is already 24 fps
+        self.assertEqual(tuple(z.shape[1:]), (32, 2, 20))           # rows padded up, mono copied to both rows
+        self.assertTrue(torch.equal(z[:, :, 0], z[:, :, 1]))
+
+        encode(vae, clip, 48.0, 40)
+        self.assertEqual(vae.seen, (1, 64000, 1))     # a 48 fps clip stretches audio 2x onto the 24 fps grid
+        self.assertEqual(encode(FakeAudioVAE(500), clip, 24.0, 20).shape[-1], 20)   # a longer track is cut
+
+        stereo = {"waveform": torch.zeros(2, 2, 44100), "sample_rate": 44100}
+        self.assertEqual(tuple(encode(FakeAudioVAE(20), stereo, 24.0, 20).shape), (1, 32, 2, 20))
+
+        for shape in ((32000,), (1, 32000), (2, 32000)):     # bare, mono and stereo without a batch
+            encode(vae, {"waveform": torch.zeros(*shape), "sample_rate": 32000}, 24.0, 20)
+            self.assertEqual(vae.seen, (1, 32000, 2 if shape[0] == 2 else 1))
+
+        encode(vae, clip, 0.0, 20)                           # an unset fps widget is not a divide-by-zero
+        self.assertEqual(vae.seen, (1, 32000, 1))
+
+    def test_audio_conditioning_needs_the_audio_vae(self):
+        class TailVAE:
+            def encode(self, frames):
+                return torch.zeros(1, 24, viggle._frames_to_latents(len(frames)), 2, 2)
+
+        class FakeAudioVAE:
+            audio_sample_rate = 32000
+
+            def __init__(self):
+                self.calls = 0
+
+            def encode(self, audio):
+                self.calls += 1
+                return torch.ones(1, 32, 2, 4096)
+
+        text = {"prompt_embeds": conditioning()[0][0], "text_token_tags": torch.zeros(3, dtype=torch.int64)}
+        video = torch.zeros(200, 32, 32, 3)
+        clip = {"waveform": torch.zeros(1, 2, 64000), "sample_rate": 32000}
+        node = viggle.ViggleAnimateConditioningWindowed()
+        with self.assertRaisesRegex(ValueError, "audio VAE"):
+            node.build(video, video[:1], text, TailVAE(), 0, 0, 124, 22, audio=clip)
+
+        audio_vae = FakeAudioVAE()
+        plan, _ = node.build(video, video[:1], text, TailVAE(), 0, 0, 124, 22, audio=clip, audio_vae=audio_vae)
+        self.assertEqual(plan["audio_latent"].shape[-1], round(plan["total_frames"] / 24 * 40))
+        self.assertEqual(plan["audio_digest"], viggle._fingerprint(plan["audio_latent"], ("drive_audio_v1",)))
+
+        viggle._LATENT_CACHE.clear()
+        plan, _ = node.build(video, video[:1], text, TailVAE(), 0, 0, 124, 22,
+                             audio={"waveform": None, "sample_rate": 32000}, audio_vae=audio_vae)
+        self.assertIsNone(plan["audio_latent"])      # a silent clip: keep generating as before
+        self.assertEqual(plan["audio_digest"], b"")
 
     def test_anchor_rejects_short_decode_and_wrong_encoder(self):
         vae = type("VAE", (), {})()

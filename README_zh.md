@@ -20,6 +20,13 @@
 
 也就是说，4-step 并不代表 4 次模型推理，而是 4 个 sigma 点，其中最后一个 `0.0` 是轨迹终点，因此实际只执行 3 次 forward。
 
+## 1.3.3 更新
+
+- **驱动音频口型同步**：**Viggle-Animate Conditioning (H3, Windowed)** 新增可选 `audio`、`audio_vae` 和 `fps` 输入。接入驱动视频自己的音轨和 MiniMax-H3 **音频 VAE** 后，整段音频只编码一次，其潜变量在整个去噪过程中作为**干净条件**保留在目标音频行里，嘴部跟随真实台词，而不是模型自己生成又被丢弃的音轨。
+- **Viggle Chunked Sampler** 新增第三个输出 `audio_latent`：拼接后的音频潜变量（普通 LATENT，可用 **VAE Decode (Audio)** 解码）；`chunk_map` 会写明音频是驱动条件还是模型生成。
+- 块缓存和循环检查点的 key 包含已编码音轨的指纹，更换音轨不会误用上一段音轨采出的块。
+- `audio` 留空则保持旧行为：音频行为空、由模型生成，保存时丢弃。
+
 ## 1.3.2 更新
 
 - 修复非网格帧数下末块动作参考与生成目标的潜变量长度不一致：VAE 编码前填充末尾参考，使两者长度匹配。维护者的 289 帧测试确认末尾漂移已解决。
@@ -41,8 +48,8 @@
 |---|---|
 | **Load Text Conditioning (Viggle)** | 从 `models/text_cond/` 下拉加载冻结文本条件 |
 | **Viggle-Animate Conditioning (H3)** | 构建条件 + AV latent:视频优先的参考顺序,两个参考均按驱动视频短边嵌套 —— 即微调训练时使用的布局 |
-| **Viggle-Animate Conditioning (H3, Windowed)** | 将驱动视频划分为重叠窗口，并为每块构建参考条件；输出 `cond_set` 接分块采样器，`guider_positive` 接 guider |
-| **Viggle Chunked Sampler** | 逐块采样并保留上一块的重叠内容，复用符合条件的缓存，最后统一解码；输出视频帧 `frames` 和分块信息 `chunk_map` |
+| **Viggle-Animate Conditioning (H3, Windowed)** | 将驱动视频划分为重叠窗口，并为每块构建参考条件；可选地将驱动音频编码为干净的目标音频潜变量；输出 `cond_set` 接分块采样器，`guider_positive` 接 guider |
+| **Viggle Chunked Sampler** | 逐块采样并保留上一块的重叠内容，复用符合条件的缓存，最后统一解码；输出视频帧 `frames`、分块信息 `chunk_map` 和拼接后的 `audio_latent` |
 | **Viggle Chunk Loop Start** | 创建运行目录并按分块计划启动循环；`initial_state` 留空 |
 | **Viggle Sample Chunk** | 采样并保存当前块；输出 LATENT、循环状态、保存文件名前缀，显示实时进度 |
 | **Viggle Chunk Loop End** | 等待当前块解码及所连接的保存节点完成，再进入下一块 |
@@ -150,6 +157,7 @@ ComfyUI/models/vae/
 可选：
 
 * [minimax_h3_video_vae_int8_convrot.safetensors](https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/minimax_h3_video_vae_int8_convrot.safetensors)（3.17 GB，低显存）
+* 如需口型同步，再加 MiniMax-H3 **音频 VAE**（例如 `minimax_h3_audio_vae_fp16.safetensors`，同属 `vae/` 目录）：接到 Windowed Conditioning 的 `audio_vae`，`audio` 接驱动视频音轨
 * [minimax_h3_video_vae_fp16.safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors)（5.21 GB）
 
 ## 模型目录结构
@@ -258,7 +266,8 @@ Load Text Conditioning (Viggle) ---------------+                              Sa
 每块均为 **124 帧**。361 帧输入也以 362 帧为生成目标，不再截到 345 帧。
 末尾参考在 VAE 编码前重复最后一帧以填满生成网格；Chunked Sampler 解码后裁回源帧数，高级循环的外部解码仍包含填充。
 帧数以加载器实际输出的图像为准；帧率转换后可能与源视频元数据不同。
-- 丢弃模型生成的音频。需要声音时，将驱动视频的音频接到视频保存节点，并与保留下来的视频长度对齐；输入和输出保持 **24 fps**。
+- **口型同步（可选）：** 将驱动视频的音频接到 Windowed Conditioning 的 `audio`，并将 MiniMax-H3 **音频 VAE** 接到 `audio_vae`。整段去噪过程中，目标音频行都会保持这一干净潜变量（H3 作者提出的口型同步做法），嘴部跟随真实台词而不是模型自己猜的音轨。只有当视频不是 24 fps 加载时才需要改 `fps`：渲染固定为 24 fps，`fps` 只用于把音频对到渲染时间轴上（30 fps 源与画面保持同步）。
+- 不接 `audio` 时维持旧行为：音频行由模型生成并被丢弃。需要声音时，将驱动视频的音频接到视频保存节点，并与保留下来的视频长度对齐；输入和输出保持 **24 fps**。采样器的 `audio_latent` 输出是拼接后的音频潜变量（接了驱动音频则为驱动音频，否则为生成），可用 ComfyUI 自带的 **VAE Decode (Audio)** 解码。
 - 无效 sigma 调度或含 NaN/Inf 的分块潜变量会触发明确错误，防止损坏结果进入缓存或传给后续分块。
 
 ### 分块循环节点

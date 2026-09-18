@@ -57,6 +57,12 @@ where the chunks are and what each of them conditions on.
 | `chunk_frames` | Maximum window length (default 124; minimum configurable 22). Short clips use fewer frames; longer clips keep full windows, including the final window. |
 | `continuation` | `five_frame_anchor` (default): five decoded/re-encoded frames, two pinned latents, 119-frame stride with 124-frame windows. `latent_overlap`: previous raw-latent carry for comparison. |
 | `overlap_frames` | Used only in `latent_overlap` mode. Frames carried from the preceding window and pinned (default 22). Clamped below the window length so every new window makes progress. The final window shifts back to end at the generation boundary, increasing its overlap. |
+| `audio` | Optional: the driving clip's own soundtrack (the same clip's audio, e.g. **Load Audio** / video-to-audio). H3 animates the mouth to the *target* audio rows, so holding the real track there makes the character lip-sync to it instead of to a track the model invents. Leave empty to keep generating (and discarding) audio. |
+| `audio_vae` | MiniMax-H3 **audio** VAE (the audio half of the base model, loaded with a normal VAELoader). Required whenever `audio` is connected; the video VAE cannot encode audio. |
+| `fps` | Frame rate the driving clip was loaded at; default `24`. The render is always 24 fps, so this only maps the soundtrack onto the render timeline: at 24 the audio is used as-is, at 30 the waveform is stretched 1.25× so it stays with the frames it belongs to. It does not change the video timing. |
+
+**Lip-sync wiring.** Drive `audio` from the same clip as `cond_video` (Load Video → its audio output, or **Load Audio** on the same file) and connect the H3 audio VAE to `audio_vae`. The clip is encoded once, then each chunk takes the rows for its own frame range, so the audio stays aligned across window joins and through the five anchor frames. The encoded track is cached, and its fingerprint goes into every chunk key: another soundtrack is another chunk, never a cache hit.
+The bundled example workflows leave these three sockets empty, so they render as before until you wire them.
 
 **Outputs**
 
@@ -123,7 +129,8 @@ previous chunk's output through a five-frame VAE anchor (or raw overlap in
 | Slot | Name | Type |
 |---|---|---|
 | 0 | `frames` | `IMAGE` — the finished clip, decoded once |
-| 1 | `chunk_map` | `STRING` — per-chunk report: frame range, seconds, effective seed, carry, `[cached]`/`[rendered]` |
+| 1 | `chunk_map` | `STRING` — per-chunk report: frame range, seconds, effective seed, carry, `[cached]`/`[rendered]`, and whether the audio is the conditioned soundtrack or a generated track |
+| 2 | `audio_latent` | `LATENT` — the assembled AV audio rows, `[1, 32, 2, T]` at 40 rows/s; the driving clip's own latent when `audio` was conditioned. Decodable with core **VAE Decode (Audio)**; for saving, the original clip audio is normally simpler. |
 
 **How carry works.** In `five_frame_anchor`, five decoded frames at the next
 window start are re-encoded and only their two H3 temporal latents are pinned.
@@ -190,8 +197,15 @@ The STRING status outputs remain ordinary execution outputs, not live displays.
 Each iteration writes `chunk_NNNN_<fingerprint>.latent` plus an updated
 `manifest.json` atomically before returning. The fingerprint covers the sampling
 graph (loaders' files, node code), this chunk's conditioning, the sigmas, the
-window, canvas, effective seed and the predecessor chunk's fingerprint — so a
+window, canvas, effective seed, the predecessor chunk's fingerprint and the
+conditioned soundtrack's fingerprint — so a
 changed setting silently becomes a new checkpoint file and old takes stay on disk.
+
+**Audio.** With `audio` connected on the conditioning node, each window takes its
+own slice of the encoded driving soundtrack and holds it clean (denoise mask 0)
+for the whole denoise, so the mouth lip-syncs to it; the previous chunk's audio is
+not carried over, because that slice already covers the overlap. With `audio`
+empty the audio rows stay empty and are generated, then discarded.
 
 Connect the H3 VAE to Sample Chunk for `five_frame_anchor` mode. The updated
 example includes this connection; older loop workflows need this additional wire.

@@ -383,7 +383,7 @@ class LoopTests(unittest.TestCase):
              patch.object(viggle.latent_preview, "prepare_callback", lambda *a, **k: None):
             guider = core.Guider_Basic(self.model)
             guider.set_conds(conditioning())
-            frames, _ = viggle.ViggleChunkedSampler().sample(guider, comfy.samplers.ksampler('euler'),
+            frames, *_ = viggle.ViggleChunkedSampler().sample(guider, comfy.samplers.ksampler('euler'),
                 torch.tensor([1.0, 6 / 7, 0.6, 0.0]), plan, vae, 42, 0, 0)
         self.assertEqual(len(frames), 322)
         self.assertTrue(torch.equal(assembled['samples'], vae.last_latent))
@@ -396,6 +396,54 @@ class LoopTests(unittest.TestCase):
         self.assertTrue(self.execute(prompt).success)
         self.assertEqual([e[1] for e in self.record if e[0] == "sample"], [999, 44])
         self.assertEqual([e[1] for e in self.record if e[0] == "encode"], [5, 5])
+
+    def test_loop_chunks_take_clean_audio_from_the_plan(self):
+        plan, self.n_chunks = cond_set_fixture(328, 124, 5)
+        plan["continuation"] = "five_frame_anchor"
+        plan["source_frames"] = 322
+        total_a = round(328 / 24 * 40)
+        plan["audio_latent"] = (torch.arange(total_a, dtype=torch.float32)
+                                .view(1, 1, 1, total_a).expand(1, 32, 2, total_a).contiguous())
+        plan["audio_digest"] = b"drive"
+        TestCondSet.cond_set = plan
+        TestVAE.vae = AnchorVAE(self.record)
+        original = loop.ViggleChunkedSampler._sample_window   # captured before patching
+        seen = []
+
+        def spy(self_, noise, guider, sampler, sigmas, cond, seed_i, ch, cw, a, b, carry, v, au, au_clean=False):
+            seen.append((a, b, au.clone(), au_clean))
+            return original(self_, noise, guider, sampler, sigmas, cond, seed_i, ch, cw, a, b, carry, v, au, au_clean)
+
+        def run(resume=False):
+            p = self.prompt("audio_loop", resume=resume)
+            p["9"]["inputs"]["vae"] = ["11", 0]     # five_frame_anchor needs the VAE for its anchor
+            return self.execute(p)
+
+        with patch.object(loop.ViggleChunkedSampler, "_sample_window", spy):
+            self.assertTrue(run().success)
+
+        self.assertEqual([s[3] for s in seen], [True] * self.n_chunks)   # never regenerated
+        starts = {tuple(s[2][0, 0, 0, :3].tolist()) for s in seen}    # rows carry their absolute index
+        self.assertEqual(len(starts), self.n_chunks)                  # a different slice per chunk
+        for a, b, au, clean in seen:
+            a0, a1 = round(a / 24 * 40), round((b + 1) / 24 * 40)
+            self.assertTrue(torch.equal(au, plan["audio_latent"][..., a0:a1]))
+
+        # Resuming with the same soundtrack replays every checkpoint...
+        seen.clear()
+        self.record.clear()
+        with patch.object(loop.ViggleChunkedSampler, "_sample_window", spy):
+            self.assertTrue(run(resume=True).success)
+        self.assertEqual([e[0] for e in self.record if e[0] == "sample"], [])
+        self.assertEqual(seen, [])          # restored chunks never reach the sampler
+
+        # ... but another soundtrack is another chunk, so nothing may be replayed.
+        plan["audio_digest"] = b"other"
+        seen.clear()
+        self.record.clear()
+        with patch.object(loop.ViggleChunkedSampler, "_sample_window", spy):
+            self.assertTrue(run(resume=True).success)
+        self.assertEqual(len([e for e in self.record if e[0] == "sample"]), self.n_chunks)
 
     def test_short_windows_decode_full_length_and_resume_rerender(self):
         # Exercise the real H3 temporal decoder; only the learned spatial

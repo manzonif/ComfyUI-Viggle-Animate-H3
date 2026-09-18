@@ -7,6 +7,7 @@ import math
 import weakref
 
 import torch
+import torchaudio
 
 import folder_paths
 import comfy.ldm.minimax.vae
@@ -38,6 +39,7 @@ def _send_progress(node_id, text):
 
 CANVAS_MULTIPLE = 32
 FPS = 24
+AUDIO_LATENT_FPS = 40
 ANCHOR_FRAMES = 5
 MIN_ASPECT, MAX_ASPECT = 1 / 4, 4
 
@@ -347,6 +349,39 @@ def _validate_sigmas(sigmas):
                          "0.6, 0.0. In KJNodes CustomSigmas set interpolate_to_steps to 3, not 4.")
 
 
+def _encode_drive_audio(audio_vae, audio, fps, total_a):
+    """Encode the driving clip's soundtrack onto the render's audio grid.
+
+    H3 animates the mouth to the *target* audio rows, so the driving soundtrack is
+    held there as a clean latent instead of being predicted. The clip's own timeline
+    is mapped onto the render grid first: source frame i sits at i/fps s, the 24 fps
+    render places it at i/24 s, so the waveform is stretched by fps/24 (a plain
+    resample) before it reaches the audio VAE's 32 kHz / 40-latent-frames-per-second
+    grid. Zero rows pad (or the VAE's own tail is cut) to exactly total_a rows.
+    """
+    waveform = audio["waveform"]
+    if waveform.ndim == 1:                      # [L] bare mono samples
+        waveform = waveform.view(1, 1, -1)
+    elif waveform.ndim == 2:                    # [C, L]
+        waveform = waveform.unsqueeze(0)
+    waveform = waveform[:1]                     # [1, C, L]
+    sr = int(audio["sample_rate"])
+    vae_sr = int(getattr(audio_vae, "audio_sample_rate", 32000))
+    # resample(w, A, B) reads the source at n*A/B: A = sr*24/fps stretches by fps/24
+    # and lands on the audio VAE's rate in the same pass.
+    src_sr = max(1, int(round(sr * FPS / (float(fps) or float(FPS)))))
+    if src_sr != vae_sr:
+        waveform = torchaudio.functional.resample(waveform.float(), src_sr, vae_sr)
+    z = audio_vae.encode(waveform.movedim(1, -1))  # [1, 32, channels, T]
+    if z.shape[-1] > total_a:
+        z = z[..., :total_a]
+    elif z.shape[-1] < total_a:
+        z = torch.nn.functional.pad(z, (0, total_a - z.shape[-1]))
+    if z.shape[2] == 1:                         # a mono track rides both stereo rows
+        z = torch.cat((z, z), dim=2)
+    return z.contiguous()
+
+
 class ViggleAnimateConditioningWindowed:
     """Windowed Viggle-Animate conditioning for long driving clips.
 
@@ -375,6 +410,10 @@ class ViggleAnimateConditioningWindowed:
         }, "optional": {
             "continuation": (["five_frame_anchor", "latent_overlap"], {"default": "five_frame_anchor",
                               "tooltip": "Five decoded/re-encoded frames anchor each new window. latent_overlap restores the previous raw-latent carry for comparison."}),
+            "audio": ("AUDIO", {"tooltip": "The driving clip's own soundtrack (Load Video -> GetAudio). Connected, it is encoded and held clean in the target audio rows for the whole denoise, so the mouth lip-syncs to it instead of inventing a track. Leave empty to let the model generate (discarded) audio."}),
+            "audio_vae": ("VAE", {"tooltip": "MiniMax-H3 audio VAE (the audio half of the base model). Needed by the audio input."}),
+            "fps": ("FLOAT", {"default": float(FPS), "min": 1.0, "max": 240.0, "step": 0.001,
+                              "tooltip": "Frame rate of the driving clip. The render is always 24 fps, so this maps the soundtrack onto the render timeline (24 keeps it as-is, 30 slows it by 1.25x with the frames it belongs to)."}),
         }}
 
     RETURN_TYPES = ("VIGGLE_COND_SET", "CONDITIONING")
@@ -384,8 +423,8 @@ class ViggleAnimateConditioningWindowed:
     DESCRIPTION = ("Viggle-Animate conditioning, windowed: per-chunk driving-video references "
                    "for the Viggle Chunked Sampler. Carries overlap to improve continuity across long clips.")
 
-    def build(self, cond_video, ref_image, text_cond, vae, width, height,
-              chunk_frames, overlap_frames, continuation="five_frame_anchor"):
+    def build(self, cond_video, ref_image, text_cond, vae, width, height, chunk_frames, overlap_frames,
+              continuation="five_frame_anchor", audio=None, audio_vae=None, fps=float(FPS)):
         # ---- frozen text conditioning -------------------------------------
         prompt_embeds = text_cond["prompt_embeds"]      # [1, 362, 5120] bf16
         text_token_tags = text_cond["text_token_tags"]  # [362] int64
@@ -471,10 +510,34 @@ class ViggleAnimateConditioningWindowed:
                      len(conds), total_f, total_f / FPS,
                      ", ".join(f"{a}-{b}" for a, b, _, _ in spans), reused_blocks)
 
+        # ---- optional lip-sync: the driving soundtrack as clean target audio ----
+        cond_audio, audio_digest = None, b""
+        if audio is not None:
+            if audio_vae is None:
+                raise ValueError("Viggle-Animate: connect the H3 audio VAE to condition on the driving clip's audio.")
+            if audio.get("waveform") is None:
+                logging.info("[ViggleAnimateConditioningWindowed] the driving clip carries no audio track; "
+                             "the target audio rows stay empty")
+            else:
+                total_a = round(total_f / FPS * AUDIO_LATENT_FPS)
+                akey = _fingerprint(audio["waveform"], ("drive_audio_v1", float(fps),
+                                                        int(audio["sample_rate"]), total_a, id(audio_vae)))
+                cond_audio = _cache_get(akey, audio_vae)
+                if cond_audio is None:
+                    cond_audio = _encode_drive_audio(audio_vae, audio, fps, total_a)
+                    _cache_put(akey, audio_vae, cond_audio)
+                # Content digest: rides in the chunk/checkpoint keys so another
+                # soundtrack never reuses a chunk sampled with a different one.
+                audio_digest = _fingerprint(cond_audio, ("drive_audio_v1",))
+                logging.info("[ViggleAnimateConditioningWindowed] driving audio held clean in %d target audio "
+                             "rows (%.2f s, clip at %g fps mapped onto the 24 fps render)",
+                             total_a, total_a / AUDIO_LATENT_FPS, fps)
+
         # guider_positive exists only so the guider's required `positive` socket
         # has a source — the sampler overwrites it per chunk from the cond_set.
         return ({"conds": conds, "prompts": prompts, "spans": spans,
-                 "total_frames": total_f, "source_frames": asked_f, "continuation": continuation, "canvas": (ch, cw)}, conds[0])
+                 "total_frames": total_f, "source_frames": asked_f, "continuation": continuation, "canvas": (ch, cw),
+                 "audio_latent": cond_audio, "audio_digest": audio_digest}, conds[0])
 
 
 def _encode_anchor(vae, video, offset):
@@ -514,7 +577,7 @@ class ViggleChunkedSampler:
             "sampler": ("SAMPLER", {"tooltip": "From KSamplerSelect or RES4LYF — reused for every chunk."}),
             "sigmas": ("SIGMAS", {"tooltip": "The step schedule (BasicScheduler etc.) — every chunk runs the identical schedule."}),
             "cond_set": ("VIGGLE_COND_SET", {"tooltip": "From Viggle-Animate Conditioning (H3, Windowed)."}),
-            "vae": ("VAE", {"tooltip": "MiniMax-H3 video VAE. Decodes/re-encodes continuation anchors and decodes the finished master latent; the model's (silent) audio half is discarded — keep your driving clip's own audio at save time."}),
+            "vae": ("VAE", {"tooltip": "MiniMax-H3 video VAE. Decodes/re-encodes continuation anchors and decodes the finished master latent; the audio half is only reported on audio_latent — keep your driving clip's own audio at save time."}),
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff,
                              "tooltip": "Base seed. Chunk i renders with seed + i, so the chunks vary independently while staying reproducible."}),
             "rerender_chunk": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1,
@@ -523,12 +586,13 @@ class ViggleChunkedSampler:
                                       "tooltip": "Seed for the chunk selected by rerender_chunk. Type a new number for a new take."}),
         }, "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
 
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("frames", "chunk_map")
+    RETURN_TYPES = ("IMAGE", "STRING", "LATENT")
+    RETURN_NAMES = ("frames", "chunk_map", "audio_latent")
     FUNCTION = "sample"
     CATEGORY = "sampling/viggle"
     DESCRIPTION = ("Chunked Viggle-Animate sampler: five-frame anchors or latent overlap, "
-                   "per-chunk cache and re-render.")
+                   "per-chunk cache and re-render. audio_latent is the assembled AV audio track "
+                   "(the driving clip's when conditioned); save the driving clip's own audio with the video.")
 
     def sample(self, guider, sampler, sigmas, cond_set, vae, seed,
                rerender_chunk, rerender_seed, dynprompt=None, unique_id=None):
@@ -549,6 +613,15 @@ class ViggleChunkedSampler:
         sampling_key = self._sampling_key(noise, guider, sampler)
         dev = comfy.model_management.intermediate_device()
 
+        # Audio fed in by the conditioning node is held clean (mask 0) so the model
+        # lip-syncs to it; otherwise the audio rows are generated and discarded.
+        cond_a = cond_set.get("audio_latent")
+        audio_digest = cond_set.get("audio_digest", b"")
+        if cond_a is not None and cond_a.shape[-1] != total_a:
+            raise ValueError("Viggle Chunked Sampler: the conditioning audio has %d latent rows; "
+                             "expected %d. Re-run the conditioning node."
+                             % (cond_a.shape[-1], total_a))
+
         master_v = torch.zeros([1, 24, total_lat, ch // 16, cw // 16], device=dev)
         master_a = torch.zeros([1, 32, 2, total_a], device=dev)
 
@@ -557,6 +630,8 @@ class ViggleChunkedSampler:
                      % (len(windows), total_f, total_f / FPS, ch, cw)]
         if sampling_key is None:
             chunk_map.append("Chunk reuse disabled: custom sampling state cannot be checked.")
+        chunk_map.append("Audio: %s" % ("driving soundtrack held clean (lip-sync)" if cond_a is not None
+                                        else "generated by the model, discard at save time"))
         prev_key = b"five_frame_anchor_v1" if anchor_mode else b""
         prev_end = None
         anchor = None
@@ -567,7 +642,7 @@ class ViggleChunkedSampler:
             chunk_map.append("#%d: frames %d-%d (%.1f-%.1fs) seed %d carry %d lat"
                              % (i + 1, a, b, a / FPS, (b + 1) / FPS, seed_i, carry))
             key = self._chunk_key(prev_key, sampling_key, conds[i], seed_i, ch, cw,
-                                  (a, b, lat0, latn, carry), sigmas)
+                                  (a, b, lat0, latn, carry), sigmas, audio_digest)
             cached = _chunk_cache_get(key, owners)
             _send_progress(progress_node, f"Chunk {i + 1} of {len(windows)}: frames {a}-{b}, seed {seed_i} — "
                            + ("cached" if cached is not None else "sampling"))
@@ -575,16 +650,16 @@ class ViggleChunkedSampler:
             if cached is None:
                 if anchor_mode:
                     v = torch.zeros_like(master_v[:, :, lat0:lat0 + latn])
-                    a0, a1 = round(a / FPS * 40), round((b + 1) / FPS * 40)
-                    au = torch.zeros_like(master_a[..., a0:a1])
+                    au = self._window_audio(cond_a, master_a, a, b)
                     if anchor is not None:
                         v[:, :, :carry] = anchor.to(v)
                     out_v, out_a = self._sample_window(noise, guider, sampler, sigmas, conds[i],
-                                                       seed_i, ch, cw, a, b, carry, v, au)
+                                                       seed_i, ch, cw, a, b, carry, v, au,
+                                                       cond_a is not None)
                 else:
                     out_v, out_a = self._render_chunk(noise, guider, sampler, sigmas, conds[i],
                                                       seed_i, ch, cw, a, b, lat0, latn,
-                                                      carry, master_v, master_a)
+                                                      carry, master_v, master_a, cond_a)
                 _chunk_cache_put(key, owners, out_v, out_a)
             else:
                 out_v, out_a = cached
@@ -612,32 +687,42 @@ class ViggleChunkedSampler:
                 raise ValueError("Viggle Chunked Sampler: final decode is shorter than the source video.")
             frames = frames[:source_frames]
         _send_progress(progress_node, "Completed — final video decoded; downstream saving may follow")
-        return (frames, "\n".join(chunk_map))
+        return (frames, "\n".join(chunk_map), {"samples": master_a})
+
+    @staticmethod
+    def _window_audio(cond_a, master_a, a, b):
+        """This window's target audio rows: the driving soundtrack, or empty rows to generate."""
+        total_a = master_a.shape[-1]
+        a0, a1 = min(round(a / FPS * 40), total_a), min(round((b + 1) / FPS * 40), total_a)
+        if cond_a is not None:
+            return cond_a[..., a0:a1].to(device=master_a.device, dtype=torch.float32)
+        return torch.zeros_like(master_a[..., a0:a1])
 
     def _render_chunk(self, noise, guider, sampler, sigmas, cond, seed_i,
-                      ch, cw, a, b, lat0, latn, carry, master_v, master_a):
+                      ch, cw, a, b, lat0, latn, carry, master_v, master_a, cond_a=None):
         total_a = master_a.shape[-1]
         a0 = min(round(a / FPS * 40), total_a)
         a1 = min(round((b + 1) / FPS * 40), total_a)
         v = master_v[:, :, lat0:lat0 + latn].clone()
-        au = master_a[:, :, :, a0:a1].clone()
+        au = (cond_a[..., a0:a1].to(device=master_a.device, dtype=torch.float32) if cond_a is not None
+              else master_a[:, :, :, a0:a1].clone())
         out_v, out_a = self._sample_window(noise, guider, sampler, sigmas, cond, seed_i,
-                                          ch, cw, a, b, carry, v, au)
+                                          ch, cw, a, b, carry, v, au, cond_a is not None)
         master_v[:, :, lat0:lat0 + latn] = out_v
         master_a[:, :, :, a0:a1] = out_a
         return out_v.cpu(), out_a.cpu()
 
     def _sample_window(self, noise, guider, sampler, sigmas, cond, seed_i,
-                       ch, cw, a, b, carry, v, au):
+                       ch, cw, a, b, carry, v, au, au_clean=False):
         latn = v.shape[2]
         samples = comfy.nested_tensor.NestedTensor((v, au))
         samples = comfy.sample.fix_empty_latent_channels(guider.model_patcher, samples)
         chunk_latent = {"samples": samples}
 
         denoise_mask = None
-        if carry > 0:  # pin the overlap to the previous chunk's output
+        if carry > 0 or au_clean:  # pin the overlap, and/or hold the audio rows clean
             mask_v = torch.ones([1, 1, latn, ch // 16, cw // 16], device=v.device)
-            mask_a = torch.ones([1, 1, 1, au.shape[-1]], device=au.device)
+            mask_a = torch.full([1, 1, 1, au.shape[-1]], 0.0 if au_clean else 1.0, device=au.device)
             mask_v[:, :, :carry] = 0.0
             denoise_mask = comfy.nested_tensor.NestedTensor((mask_v, mask_a))
 
@@ -683,13 +768,13 @@ class ViggleChunkedSampler:
             return None
         return h.digest()
 
-    def _chunk_key(self, prev_key, sampling_key, cond, seed_i, ch, cw, span, sigmas):
+    def _chunk_key(self, prev_key, sampling_key, cond, seed_i, ch, cw, span, sigmas, audio=b""):
         if prev_key is None or sampling_key is None:
             return None
         h = hashlib.sha256()
         h.update(prev_key)
         h.update(sampling_key)
-        if not _hash_cache_value(h, (cond, seed_i, ch, cw, span, sigmas)):
+        if not _hash_cache_value(h, (cond, seed_i, ch, cw, span, sigmas, audio)):
             return None
         return h.digest()
 

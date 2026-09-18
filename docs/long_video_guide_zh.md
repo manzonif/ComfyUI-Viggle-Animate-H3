@@ -24,8 +24,8 @@
 |---|---|
 | Load Text Conditioning | 加载固定文本条件，接条件节点的 `text_cond` |
 | 原始 Conditioning (H3) | 单段生成的条件和 AV 潜变量，接普通采样流程 |
-| Windowed Conditioning | 分配重叠窗口并编码参考；`cond_set` 接 Start 或 Chunked Sampler，`guider_positive` 接 guider |
-| Chunked Sampler | 一个节点内采样所有块并最终解码；输出 `frames` 直接保存、`chunk_map` 查看种子和范围；内部需要 VAE |
+| Windowed Conditioning | 分配重叠窗口并编码参考；`cond_set` 接 Start 或 Chunked Sampler，`guider_positive` 接 guider；可选的 `audio`/`audio_vae`/`fps` 将驱动音轨作为干净目标音频接入（口型同步） |
+| Chunked Sampler | 一个节点内采样所有块并最终解码；输出 `frames` 直接保存、`chunk_map` 查看种子和范围、`audio_latent` 为拼接后的音频潜变量；内部需要 VAE |
 | Loop Start | 选择目录并初始化循环；`state` 接 Sample Chunk，`loop` 接 End；`initial_state` 留空，循环内部自动传入上一轮状态 |
 | Sample Chunk | 采样当前块并先保存潜变量；`chunk` 接 End，`video_latent` 接外部 VAE Decode，没有 VAE 输入 |
 | Loop End | `loop` 接 Start，`chunk` 接 Sample Chunk，`images` 接解码图像；`after_save` 可接 Video Combine 的 `filenames`，确保保存结束才继续 |
@@ -46,6 +46,8 @@ Sample Chunk 的 `filename_prefix` 是保存路径前缀，包含运行名、块
    **要永久保存视频，请启用 `save_output`**；示例默认预览是临时文件，潜变量检查点独立保存。
 5. End `chunks` 接 Assemble，`chunk_number = 0`，再接最终 VAE Decode 和保存节点。
    输出也设为 24 fps。最终视频使用驱动音频并裁到保留的视频长度；不能直接拼接带重叠的预览视频。
+   需要口型同步时，把驱动视频的音频接到 Windowed Conditioning 的 `audio`，
+   并将 MiniMax-H3 音频 VAE 接到 `audio_vae`（非 24 fps 加载时才需改 `fps`）。
 6. Start 填一个新的 `run_name`，开启 `resume`；Sample Chunk 使用固定 `seed`，
    示例中的种子控制为 `randomize`，测试取消/恢复前请改为 `fixed`，否则每次排队都会换种子。
    `rerender_chunk = 0`。采样配置见 README 的 sigma 预设：四点基准配 Euler、CFG 1.0，

@@ -14,6 +14,13 @@ The sampler is DMD2-distilled and works with very low step counts. **The upstrea
 
 For these manual presets with Euler and BasicGuider / CFG 1.0, **4 sigma points = 3 sampling updates / model forward passes**, **6 points = 5**, and **8 points = 7**. The final `0.0` is included in the point count. For ComfyUI and the converted/quantized models, choose **4 points for speed, 6 for balance, or 8 for quality (may over-sharpen)**.
 
+## New in 1.3.3
+
+- **Lip-sync from the driving clip.** **Viggle-Animate Conditioning (H3, Windowed)** takes optional `audio`, `audio_vae` and `fps` inputs. Connect the driving clip's own soundtrack and the MiniMax-H3 **audio** VAE: the clip is encoded once and its latent is *held clean* in the target audio rows for every denoise step, so the mouth follows the real track instead of the model inventing one to be thrown away.
+- **Viggle Chunked Sampler** gained a third output, `audio_latent` — the assembled AV audio track (a plain `LATENT`, decodable with core **VAE Decode (Audio)**). The `chunk_map` says whether the audio is conditioned or generated.
+- Chunk caches and loop checkpoint keys now include a fingerprint of the encoded soundtrack, so swapping the audio never replays a chunk rendered against a different one.
+- Leave `audio` empty for the previous behaviour: silent audio rows, a generated track, discard at save time.
+
 ## New in 1.3.2
 
 - Fix final-window motion-reference length mismatches for off-grid source lengths. The final reference is padded before VAE encoding to match the target latent count; this resolved the reported ending drift in the maintainer's 289-frame test.
@@ -36,8 +43,8 @@ for wiring, recovery and a first-run checklist.
 |---|---|
 | **Load Text Conditioning (Viggle)** | Dropdown loader for frozen text conditioning in `models/text_cond/` |
 | **Viggle-Animate Conditioning (H3)** | Builds conditioning + AV latent: video-first reference order, both references nested on the canvas short edge (the driving clip's, unless width/height are overridden) — the layout the finetune was trained with |
-| **Viggle-Animate Conditioning (H3, Windowed)** | Splits the driving clip into overlapping windows and builds each chunk's references; outputs `cond_set` for the chunked sampler and `guider_positive` for the guider |
-| **Viggle Chunked Sampler** | Samples each window, preserves overlap from the preceding chunk, reuses eligible cached chunks, and decodes the assembled video; outputs `frames` and a readable `chunk_map` |
+| **Viggle-Animate Conditioning (H3, Windowed)** | Splits the driving clip into overlapping windows and builds each chunk's references; optionally encodes the driving soundtrack as clean target audio; outputs `cond_set` for the chunked sampler and `guider_positive` for the guider |
+| **Viggle Chunked Sampler** | Samples each window, preserves overlap from the preceding chunk, reuses eligible cached chunks, and decodes the assembled video; outputs `frames`, a readable `chunk_map` and the assembled `audio_latent` |
 | **Viggle Chunk Loop Start** | Creates the run folder and starts the automatically sized chunk loop; leave `initial_state` disconnected |
 | **Viggle Sample Chunk** | Samples/checkpoints one chunk; outputs LATENT, loop state, save filename prefix; shows live progress |
 | **Viggle Chunk Loop End** | Waits for chunk decoding and any connected save dependency, then advances the loop |
@@ -118,6 +125,7 @@ ComfyUI and refresh the browser after updating to load the live-progress extensi
 **vae**
 
 * [minimax_h3_video_vae_int8_convrot.safetensors](https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/minimax_h3_video_vae_int8_convrot.safetensors) (3.17 GB, low VRAM)
+* plus the MiniMax-H3 **audio** VAE (e.g. `minimax_h3_audio_vae_fp16.safetensors`, same `vae/` folder) — only for lip-sync: it goes to Windowed Conditioning's `audio_vae`, next to the driving clip on `audio`
 * or [minimax_h3_video_vae_fp16.safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors) (5.21 GB)
 
 ## Model Storage Location
@@ -217,7 +225,8 @@ The final reference repeats its last frame only to fill the generation grid befo
 VAE encoding, keeping reference and target latent counts aligned. The H3 VAE also applies its internal temporal padding;
 this does not duplicate the rendered output. Frame counts refer to the actual images
 received from the loader, which may differ from source-video metadata after FPS conversion.
-- Generated audio is discarded. Connect the driving clip's audio to the video-saving node and match it to the retained video length; use **24 fps** for input and output.
+- **Lip-sync (optional):** connect the driving clip's soundtrack to Windowed Conditioning's `audio` and the MiniMax-H3 audio VAE to `audio_vae`. The soundtrack is held clean in the target audio rows for the whole denoise — the H3 authors' recipe for lip-sync — so the mouth tracks the speech instead of the model guessing a track. Set `fps` only when the clip was not loaded at 24 fps: the render is always 24 fps, so `fps` maps the audio onto the render timeline (a 30 fps clip keeps its audio and frames together).
+- Otherwise the audio rows are generated and discarded: connect the driving clip's audio to the video-saving node and match it to the retained video length; use **24 fps** for input and output. The sampler's `audio_latent` output is the assembled AV audio latent (conditioned, or generated when `audio` is empty) and decodes with core **VAE Decode (Audio)**.
 - Invalid sigma schedules and NaN/Inf chunk latents now stop with an actionable error before corrupt output is cached or carried into later chunks.
 
 ### Chunk loop nodes
