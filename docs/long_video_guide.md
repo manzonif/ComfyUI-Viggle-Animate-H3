@@ -262,6 +262,95 @@ get frames up to the last finished chunk.
 
 ---
 
+## Two-stage hires extend loop (new in 1.3.4)
+
+Replicates the single-shot 2-stage recipe per chunk — 1 step at the plan canvas
+(~1.2 MP) with the first model/LoRA stack → 3D latent upscale → 4 steps at high
+resolution with the second stack — while sampling stays in **your own native
+`SamplerCustomAdvanced`** nodes. The three new nodes add only the per-chunk glue;
+your `Separate AV Latent` → upscaler → `Concat AV Latent` chain is reused
+unchanged between the two samplers.
+
+```
+Hires Start ─ noise ───────────────────────┬───────────────────────┐
+  ├ latent ─▶ [audio lock, optional] ────▶ SamplerCustomAdvanced #1 (low-res, 1 step)
+  ├ conditioning ─▶ both Basic Guiders    │                            │ denoised_output
+  └ state ───────────────────────────────▶ Pin                         ▼
+                                              ▲              Separate AV Latent ─┬ video ─▶ [your 3D latent upscaler]
+                                              └──────────────────────────────────┘ audio ─▶ Concat AV Latent
+Pin ─ latent (carry + mask) ─▶ SamplerCustomAdvanced #2 (high-res, 4 steps)
+                                   │ output ─▶ Store ◀── Pin state
+Store ─ chunk ─▶ Chunk Loop End ◀── loop (Start) + images (per-chunk VAE Decode / SaveWEBM)
+Store/Loop End ─ master (final) ─▶ VAE Decode ─▶ finished video
+```
+
+### Viggle Hires Chunk Start
+
+`ViggleHiresChunkStart` — the loop start of the hires flow.
+
+| Input | Meaning |
+|---|---|
+| `cond_set` | From the windowed conditioning node (windows, per-window conditioning, canvas, audio slices). |
+| `seed` | Chunk 1's seed; chunk *i* uses `seed + i − 1`. |
+| `rerender_chunk` / `rerender_seed` | `0` disables. Chunk *k* then uses `rerender_seed`; the chain re-runs and earlier chunks reproduce with their unchanged seeds. |
+| `initial_state` | Loop feedback from Loop End; leave unlinked in the UI. |
+
+**Outputs:** 0 `loop` (`VIGGLE_LOOP`, raw link for Loop End) · 1 `state` · 2 `noise` (`NOISE`, the chunk's noise — wire to **both** samplers, as in the single shot) · 3 `conditioning` (`CONDITIONING`, this chunk's conditioning — wire to **both** guiders) · 4 `latent` (`LATENT`, the window's empty nested AV latent at the plan canvas; the clean driving-audio rows are pre-filled when audio is connected to the conditioning) · 5 `status`.
+
+An `H3-VideoAudioLock`-style node may sit between `latent` and sampler #1 exactly as in the single shot.
+
+### Viggle Hires Chunk Pin
+
+`ViggleHiresChunkPin` — between the AV concat (or the upscaler's video-only output) and the high-res sampler.
+
+| Input | Meaning |
+|---|---|
+| `latent` | Your `Concat AV Latent` output (upscaled video + audio). A video-only LATENT is also accepted; audio is then the plan's clean slice or generated. |
+| `state` | From Hires Start (slot 1). |
+
+**Outputs:** 0 `latent` (`LATENT`, nested AV, ready for sampler #2's `latent_image`) · 1 `state` (passed through).
+
+Per chunk it: (1) writes the previous chunk's high-res tail — the overlapping
+latents of the window schedule — at the front of the window; (2) pins the
+driving audio's clean slice into the audio rows when the plan carries one
+(otherwise it keeps the audio arriving from your concat, or zeros); (3) puts
+the nested denoise mask into `latent["noise_mask"]` (0 on the carry latents, 0
+on clean audio rows, 1 elsewhere) — `SamplerCustomAdvanced` reads it without
+extra wiring. The **first chunk is an unmodified pass-through**, so chunk 1
+reproduces the single-shot workflow exactly.
+
+### Viggle Hires Chunk Store
+
+`ViggleHiresChunkStore` — after the high-res sampler.
+
+| Input | Meaning |
+|---|---|
+| `latent` | Sampler #2's `output` for this window (nested AV). |
+| `state` | From Pin (slot 1). |
+
+**Outputs:** 0 `chunk` (`VIGGLE_LOOP_STATE`, to Loop End's `chunk`) · 1 `master` (`LATENT`, the running nested AV master — partial until the loop completes) · 2 `status`.
+
+It writes the window into the in-memory master at the window's absolute
+position (later chunks overwrite the overlap with their pinned, model-refined
+values), stores the tail for the next carry and validates that the hires
+canvas (whatever your upscaler emits) is identical for every chunk.
+
+### Loop End and final decode
+
+**Viggle Chunk Loop End** accepts the hires Start on `loop` and gained a third
+output: 2 `master` (`LATENT`) — the assembled nested AV master when the loop
+completes (legacy loop states return `None`). Feed it to a normal VAE Decode
+for the finished video; per-chunk decode/save still goes through the `images`
+branch (VAE Decode on the stage-2 window → SaveWEBM or Video Combine →
+`after_save`).
+
+### Semantics and limits
+
+- **Stage-2 input is an x0 anchor, not a strict continuation.** Stage 1's `denoised_output` (the x0 estimate at the split sigma) is upsampled and fed to stage 2 as `latent_image`; with sigmas starting at the split point the flow `noise_scaling` re-noises it as an anchor — the same semantics as the single shot.
+- **Canvas:** stage 1 uses the plan canvas (conditioning `width`/`height`); the final canvas is defined by your upscaler. To use high-res references later, move the conditioning to the high canvas — stage 1 keeps the low canvas.
+- **Audio:** with the 1.3.3 driving audio connected, Start pre-fills stage 1's audio rows and Pin re-pins the clean slice (mask 0) for stage 2. Without audio, the audio branch behaves as in the single shot (generated or lock-pinned silence).
+- **Master in memory:** this release keeps the hires master in RAM (as `Viggle Chunked Sampler` does); a restart re-runs the loop, and per-chunk previews are still produced. Disk checkpoints for the hires flow follow in a later release.
+
 ## Typical session
 
 1. Queue. Chunks 1..N sample, each decoded/saved as it completes.

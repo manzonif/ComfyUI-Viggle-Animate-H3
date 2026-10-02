@@ -17,6 +17,7 @@ import nodes as comfy_nodes
 import comfy.model_management
 from comfy_execution.graph_utils import GraphBuilder, is_link
 
+from comfy.nested_tensor import NestedTensor
 from comfy_extras import nodes_custom_sampler as core_sampler
 
 from .nodes import FPS, ViggleChunkedSampler, _hash_cache_value, _validate_sigmas, _send_progress, _encode_anchor
@@ -262,6 +263,202 @@ class ViggleSampleChunk:
         return (next_state, {"samples": out_v.clone()}, prefix)
 
 
+class ViggleHiresChunkStart:
+    """Loop start for the two-stage hires extend flow.
+
+    Emits the per-chunk noise, the low-res empty AV latent (stage 1) and the
+    chunk's conditioning. Actual sampling is done by the user's own
+    BasicGuider + SamplerCustomAdvanced pair; see ViggleHiresChunkPin and
+    ViggleHiresChunkStore for the carry/assembly glue.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "cond_set": ("VIGGLE_COND_SET",),
+            "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
+                             "tooltip": "Seed of the first chunk; later chunks use seed + chunk index."}),
+            "rerender_chunk": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1,
+                                       "tooltip": "0 disables. Re-running the chain uses rerender_seed for this chunk only (the whole chain re-samples, the master is in memory)."}),
+            "rerender_seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+        }, "optional": {"initial_state": ("VIGGLE_LOOP_STATE", {"forceInput": True})},
+                     "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
+
+    RETURN_TYPES = ("VIGGLE_LOOP", "VIGGLE_LOOP_STATE", "NOISE", "CONDITIONING", "LATENT", "STRING")
+    RETURN_NAMES = ("loop", "state", "noise", "conditioning", "latent", "status")
+    FUNCTION = "start"
+    CATEGORY = "sampling/viggle/experimental"
+    DESCRIPTION = "Per-chunk noise, low-res empty AV latent and conditioning for the two-stage hires extend flow."
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def start(self, cond_set, seed, rerender_chunk, rerender_seed,
+              initial_state=None, dynprompt=None, unique_id=None):
+        spans = cond_set["spans"]
+        if not spans or len(spans) != len(cond_set["conds"]):
+            raise ValueError("Viggle: conditioning windows are empty or inconsistent.")
+        if initial_state is None:
+            state = {"plan": cond_set, "index": 0, "entries": [], "previous": None,
+                     "seed": int(seed) % (1 << 64), "rerender_chunk": int(rerender_chunk),
+                     "rerender_seed": int(rerender_seed) % (1 << 64),
+                     "master_v": None, "master_a": None}
+        else:
+            state = initial_state
+        i = state["index"]
+        a, b, lat0, latn = spans[i]
+        ch, cw = cond_set["canvas"]
+        a0, a1 = round(a / FPS * 40), round((b + 1) / FPS * 40)
+        seed_i = (state["rerender_seed"] if state["rerender_chunk"] == i + 1 else state["seed"] + i) % (1 << 64)
+        dev = comfy.model_management.intermediate_device()
+        video = torch.zeros([1, 24, latn, ch // 16, cw // 16], device=dev)
+        # Connected driving audio anchors stage 1 as well; the lock-style nodes
+        # (or Pin's mask for stage 2) decide how strictly it is held.
+        audio = torch.zeros([1, 32, 2, a1 - a0], device=dev)
+        cond_a = cond_set.get("audio_latent")
+        if cond_a is not None:
+            audio = cond_a[..., a0:a1].to(device=dev, dtype=torch.float32)
+        status = f"Chunk {i + 1} of {len(spans)}: frames {a}-{b}, seed {seed_i} (stage 1: {ch}x{cw})"
+        _send_progress(dynprompt.get_display_node_id(unique_id), status)
+        return ("loop", state, core_sampler.Noise_RandomNoise(seed_i), cond_set["conds"][i],
+                {"samples": NestedTensor((video, audio)), "latent_format_version_0": torch.empty(0)}, status)
+
+
+class ViggleHiresChunkPin:
+    """Insert the previous chunk's hires tail and the denoise mask.
+
+    Connect the output of your AV concat (upscaled video + audio) here, then
+    the result to the high-res SamplerCustomAdvanced's latent_image. The node
+    also accepts the upscaler's video-only output directly.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent": ("LATENT", {"tooltip": "Your Concat AV Latent output (upscaled video + audio), or the upscaler's video-only output."}),
+            "state": ("VIGGLE_LOOP_STATE",),
+        }, "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
+
+    RETURN_TYPES = ("LATENT", "VIGGLE_LOOP_STATE")
+    RETURN_NAMES = ("latent", "state")
+    FUNCTION = "pin"
+    CATEGORY = "sampling/viggle/experimental"
+    DESCRIPTION = "Carry + mask preparation between the latent upscaler and the high-res SamplerCustomAdvanced."
+
+    def pin(self, latent, state, dynprompt, unique_id):
+        plan = state["plan"]
+        i = state["index"]
+        a, b, lat0, latn = plan["spans"][i]
+        a0, a1 = round(a / FPS * 40), round((b + 1) / FPS * 40)
+        rows = a1 - a0
+        samples = latent["samples"]
+        if getattr(samples, "is_nested", False):
+            video, audio = samples.unbind()
+        else:
+            video, audio = samples, None
+        if video.shape[2] != latn:
+            raise ValueError(f"Viggle: the hires latent has {video.shape[2]} temporal latents, expected {latn} "
+                             f"for frames {a}-{b}. Check the upscaler's temporal settings.")
+        carry = 0
+        previous = state["previous"]
+        if i > 0 and previous is not None and previous.get("video") is not None:
+            _, _, prev_lat0, prev_latn = plan["spans"][i - 1]
+            carry = max(0, prev_lat0 + prev_latn - lat0)
+            tail = previous["video"]
+            if tail.shape[2] < carry or tail.shape[-2:] != video.shape[-2:]:
+                raise ValueError("Viggle: the previous chunk's tail does not match this window "
+                                 "(the hires canvas must be identical for every chunk).")
+            video = video.clone()
+            video[:, :, :carry] = tail[:, :, :carry].to(video)
+        cond_a = plan.get("audio_latent")
+        audio_clean = cond_a is not None
+        if cond_a is not None:
+            # The plan's clean driving slice is canonical; it overrides whatever
+            # the stage-1 branch produced.
+            audio = cond_a[..., a0:a1].to(device=video.device, dtype=torch.float32)
+        elif audio is None:
+            audio = torch.zeros([1, 32, 2, rows], device=video.device)
+        if audio.shape[-1] != rows:
+            fixed = torch.zeros([1, 32, 2, rows], device=audio.device)
+            fixed[..., :min(rows, audio.shape[-1])] = audio[..., :min(rows, audio.shape[-1])]
+            audio = fixed
+        mask = None
+        if carry or audio_clean:
+            mask_v = torch.ones([1, 1, latn, video.shape[3], video.shape[4]], device=video.device)
+            if carry:
+                mask_v[:, :, :carry] = 0
+            mask_a = torch.full([1, 1, 1, rows], 0.0 if audio_clean else 1.0, device=video.device)
+            mask = NestedTensor((mask_v, mask_a))
+        out = dict(latent)
+        out["samples"] = NestedTensor((video, audio))
+        if mask is not None:
+            out["noise_mask"] = mask
+        _send_progress(dynprompt.get_display_node_id(unique_id),
+                       f"Chunk {i + 1} of {len(plan['spans'])}: pinned {carry} carry latents at "
+                       f"{video.shape[3]}x{video.shape[4]}" + (", clean audio" if audio_clean else ""))
+        return (out, state)
+
+
+class ViggleHiresChunkStore:
+    """Collect the high-res window into the in-memory master latent."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "latent": ("LATENT", {"tooltip": "The high-res SamplerCustomAdvanced output of this window."}),
+            "state": ("VIGGLE_LOOP_STATE",),
+        }, "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
+
+    RETURN_TYPES = ("VIGGLE_LOOP_STATE", "LATENT", "STRING")
+    RETURN_NAMES = ("chunk", "master", "status")
+    FUNCTION = "store"
+    CATEGORY = "sampling/viggle/experimental"
+    DESCRIPTION = "Assembles the high-res master between the high-res sampler and Viggle Chunk Loop End."
+
+    def store(self, latent, state, dynprompt, unique_id):
+        plan = state["plan"]
+        i = state["index"]
+        spans = plan["spans"]
+        a, b, lat0, latn = spans[i]
+        a0, a1 = round(a / FPS * 40), round((b + 1) / FPS * 40)
+        samples = latent["samples"]
+        if getattr(samples, "is_nested", False):
+            video, audio = samples.unbind()
+        else:
+            video, audio = samples, None
+        if video.shape[2] != latn:
+            raise ValueError(f"Viggle: the hires output has {video.shape[2]} temporal latents, expected {latn}.")
+        video = video.detach().to(torch.float32).contiguous()
+        if audio is not None:
+            audio = audio.detach().to(torch.float32).contiguous()
+        if not torch.isfinite(video).all() or (audio is not None and not torch.isfinite(audio).all()):
+            raise ValueError(f"Viggle: chunk {i + 1} contains NaN/Inf.")
+        total_lat = spans[-1][2] + spans[-1][3]
+        total_a = round(plan["total_frames"] / FPS * 40)
+        master_v, master_a = state["master_v"], state["master_a"]
+        if master_v is None:
+            if i:
+                raise ValueError("Viggle: the hires master was lost; restart the loop from chunk 1.")
+            master_v = torch.zeros([1, 24, total_lat, video.shape[3], video.shape[4]], device="cpu")
+            master_a = torch.zeros([1, 32, 2, total_a], device="cpu")
+        else:
+            if (video.shape[3], video.shape[4]) != master_v.shape[-2:]:
+                raise ValueError("Viggle: the hires canvas changed mid-run (upscale settings differ between chunks).")
+            if i != len(state["entries"]):
+                raise ValueError("Viggle: chunk order out of sync with the master; restart the loop from chunk 1.")
+        master_v[:, :, lat0:lat0 + latn] = video.to(master_v)
+        if audio is not None and audio.shape[-1] == a1 - a0:
+            master_a[..., a0:a1] = audio.to(master_a)
+        carry_next = max(0, lat0 + latn - spans[i + 1][2]) if i + 1 < len(spans) else 0
+        previous = {"span": [a, b, lat0, latn],
+                    "video": (video[:, :, -carry_next:].clone().cpu() if carry_next else None)}
+        entries = state["entries"] + [{"span": [a, b, lat0, latn]}]
+        status = (f"Chunk {i + 1} of {len(spans)} stored: master "
+                  f"{master_v.shape[2]}x{video.shape[3]}x{video.shape[4]}")
+        _send_progress(dynprompt.get_display_node_id(unique_id), status)
+        next_state = {**state, "index": i + 1, "entries": entries, "previous": previous,
+                      "master_v": master_v, "master_a": master_a}
+        return (next_state, {"samples": NestedTensor((master_v, master_a))}, status)
+
+
 class ViggleChunkLoopEnd:
     @classmethod
     def INPUT_TYPES(cls):
@@ -271,8 +468,8 @@ class ViggleChunkLoopEnd:
                 "optional": {"after_save": ("*", {"tooltip": "Optional completion dependency, e.g. VHS Video Combine's filenames output."})},
                 "hidden": {"dynprompt": "DYNPROMPT", "unique_id": "UNIQUE_ID"}}
 
-    RETURN_TYPES = ("VIGGLE_CHUNKS", "STRING")
-    RETURN_NAMES = ("chunks", "status")
+    RETURN_TYPES = ("VIGGLE_CHUNKS", "STRING", "LATENT")
+    RETURN_NAMES = ("chunks", "status", "master")
     FUNCTION = "finish"
     CATEGORY = "sampling/viggle/experimental"
     OUTPUT_NODE = True
@@ -287,11 +484,20 @@ class ViggleChunkLoopEnd:
                            f"Chunk {chunk['index']} of {len(chunk['plan']['spans'])} — "
                            + ("loop completed (final assembly/decode may follow)" if done else "decode/save finished"))
         if chunk["index"] == len(chunk["plan"]["spans"]):
-            collection = {"version": CHECKPOINT_VERSION, "run_name": chunk["run_name"],
+            run_name = chunk.get("run_name")
+            collection = {"version": CHECKPOINT_VERSION,
                           "canvas": list(chunk["plan"]["canvas"]),
                           "total_frames": chunk["plan"]["total_frames"],
-                          "continuation": chunk["plan"].get("continuation", "latent_overlap"), "entries": chunk["entries"]}
-            return (collection, f"Completed {chunk['index']} chunks. Saved in {_run_dir(chunk['run_name'])}")
+                          "continuation": chunk["plan"].get("continuation", "latent_overlap"),
+                          "entries": chunk["entries"]}
+            if run_name is not None:
+                collection["run_name"] = run_name
+                message = f"Completed {chunk['index']} chunks. Saved in {_run_dir(run_name)}"
+            else:
+                message = f"Completed {chunk['index']} chunks (hires master kept in memory)."
+            master_v = chunk.get("master_v")
+            master = ({"samples": NestedTensor((master_v, chunk["master_a"]))} if master_v is not None else None)
+            return (collection, message, master)
 
         # Copy only nodes lying between Loop Start and this End, as in ComfyUI's
         # graph-expansion loop example. External loaders/conditioning stay shared.
@@ -307,8 +513,8 @@ class ViggleChunkLoopEnd:
                     children.setdefault(value[0], set()).add(node_id)
                     pending.append(value[0])
         start_id = loop[0]
-        if dynprompt.get_node(start_id)["class_type"] != "ViggleChunkLoopStart":
-            raise ValueError("Viggle: connect Loop End's loop directly to Viggle Chunk Loop Start.")
+        if dynprompt.get_node(start_id)["class_type"] not in ("ViggleChunkLoopStart", "ViggleHiresChunkStart"):
+            raise ValueError("Viggle: connect Loop End's loop directly to Viggle Chunk Loop Start (or Hires Chunk Start).")
         contained, pending = set(), [start_id]
         while pending:
             node_id = pending.pop()
@@ -326,7 +532,8 @@ class ViggleChunkLoopEnd:
             for name, value in dynprompt.get_node(node_id).get("inputs", {}).items():
                 node.set_input(name, copies[value[0]].out(value[1]) if is_link(value) and value[0] in copies else value)
         copies[start_id].set_input("initial_state", dynprompt.get_node(unique_id)["inputs"]["chunk"])
-        return {"result": (copies[unique_id].out(0), copies[unique_id].out(1)), "expand": graph.finalize()}
+        return {"result": (copies[unique_id].out(0), copies[unique_id].out(1), copies[unique_id].out(2)),
+                "expand": graph.finalize()}
 
 
 class ViggleAssembleChunkLatents:
@@ -378,8 +585,13 @@ class ViggleAssembleChunkLatents:
 
 
 NODE_CLASS_MAPPINGS = {cls.__name__: cls for cls in (ViggleChunkLoopStart, ViggleSampleChunk,
+                                                   ViggleHiresChunkStart, ViggleHiresChunkPin,
+                                                   ViggleHiresChunkStore,
                                                    ViggleChunkLoopEnd, ViggleAssembleChunkLatents)}
 NODE_DISPLAY_NAME_MAPPINGS = {"ViggleChunkLoopStart": "Viggle Chunk Loop Start",
                             "ViggleSampleChunk": "Viggle Sample Chunk",
+                            "ViggleHiresChunkStart": "Viggle Hires Chunk Start",
+                            "ViggleHiresChunkPin": "Viggle Hires Chunk Pin",
+                            "ViggleHiresChunkStore": "Viggle Hires Chunk Store",
                             "ViggleChunkLoopEnd": "Viggle Chunk Loop End",
                             "ViggleAssembleChunkLatents": "Viggle Assemble Chunk Latents"}

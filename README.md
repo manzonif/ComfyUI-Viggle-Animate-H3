@@ -14,6 +14,15 @@ The sampler is DMD2-distilled and works with very low step counts. **The upstrea
 
 For these manual presets with Euler and BasicGuider / CFG 1.0, **4 sigma points = 3 sampling updates / model forward passes**, **6 points = 5**, and **8 points = 7**. The final `0.0` is included in the point count. For ComfyUI and the converted/quantized models, choose **4 points for speed, 6 for balance, or 8 for quality (may over-sharpen)**.
 
+## New in 1.3.4
+
+- **Two-stage hires extend loop.** Three new nodes let the chunked loop run the single-shot 2-stage recipe — 1 low-res step → latent upscale → 4 high-res steps with a second model/LoRA stack — using your own **native `SamplerCustomAdvanced`** for both stages, so you keep full control of the model stacks, the upscaler and the sigma split:
+  - **Viggle Hires Chunk Start**: per-chunk `noise`, the window's low-res empty AV `latent`, the chunk's `conditioning` (wire to both guiders) and the loop state.
+  - **Viggle Hires Chunk Pin**: between your AV concat and the high-res sampler — inserts the previous chunk's high-res tail (masked, denoise mask 0) and pins the driving audio's clean rows (mask 0). First chunk is an exact pass-through of the single-shot chain.
+  - **Viggle Hires Chunk Store**: assembles the high-res master (in memory) and feeds the existing **Viggle Chunk Loop End**, which now also outputs the final `master` LATENT (nested AV) for a normal VAE Decode.
+
+  The final canvas is set by your upscaler (identical for every chunk); stage 1 stays at the conditioning canvas. Disk checkpoints for the hires flow arrive in a later release. Details: [docs/long_video_guide.md](docs/long_video_guide.md#two-stage-hires-extend-loop-new-in-134).
+
 ## New in 1.3.3
 
 - **Lip-sync from the driving clip.** **Viggle-Animate Conditioning (H3, Windowed)** takes optional `audio`, `audio_vae` and `fps` inputs. Connect the driving clip's own soundtrack and the MiniMax-H3 **audio** VAE: the clip is encoded once and its latent is *held clean* in the target audio rows for every denoise step, so the mouth follows the real track instead of the model inventing one to be thrown away.
@@ -261,6 +270,37 @@ Loop Start ─ loop ────────────────────
 every chunk, including restored chunks. No extra node or wiring is needed. Restart
 ComfyUI and refresh the browser after updating. “Loop completed” excludes any
 downstream final assembly/decode/save; Start, End and Assemble retain their STRING status outputs.
+
+### Two-stage hires extend loop (new in 1.3.4)
+
+For the single-shot 2-stage recipe (1 step at ~1.2 MP with one model/LoRA stack →
+3D latent upscale → 4 steps at high resolution with a second stack), three new nodes
+run the same chain inside the chunk loop while the **native `SamplerCustomAdvanced`**
+does the sampling. Your existing `Separate AV Latent` → upscaler → `Concat AV Latent`
+chain is reused unchanged between the two samplers.
+
+| Node | Purpose |
+|---|---|
+| **Viggle Hires Chunk Start** | Loop start: per-chunk `noise` (seed + index), the window's empty AV `latent` at the plan canvas (stage 1), the chunk's `conditioning` (connect to both guiders), `loop`/`state`. `rerender_chunk`/`rerender_seed` override one chunk's seed. |
+| **Viggle Hires Chunk Pin** | Takes the AV concat output (or the upscaler's video-only output), writes the previous chunk's high-res tail at the front of the window and builds the nested denoise mask (0 on the carry, 0 on clean driving-audio rows). First chunk: unmodified pass-through. |
+| **Viggle Hires Chunk Store** | Writes the high-res window into the in-memory master (overlap overwritten), keeps the tail for the next carry, forwards state to Loop End. Also outputs the running `master` LATENT. |
+
+```text
+Hires Start ─ noise ───────────────────────┬───────────────────────┐
+  ├ latent ─▶ [audio lock, optional] ────▶ SamplerCustomAdvanced #1 (low-res, 1 step)
+  ├ conditioning ─▶ both Basic Guiders    │                            │ denoised_output
+  └ state ───────────────────────────────▶ Pin                         ▼
+                                              ▲              Separate AV Latent ─┬ video ─▶ [your 3D latent upscaler]
+                                              └──────────────────────────────────┘ audio ─▶ Concat AV Latent
+Pin ─ latent (carry + mask) ─▶ SamplerCustomAdvanced #2 (high-res, 4 steps)
+                                   │ output ─▶ Store ◀── Pin state
+Store ─ chunk ─▶ Chunk Loop End ◀── loop (Start) + images (per-chunk VAE Decode / SaveWEBM)
+Store/Loop End ─ master (final) ─▶ VAE Decode ─▶ finished video
+```
+
+- Connect Start's `conditioning` to **both** guiders and Start's `noise` to **both** samplers (the stages share the chunk's noise, as in the single shot). The final canvas is whatever your upscaler emits and must be identical for every chunk — the nodes validate this.
+- The clean driving audio (1.3.3) flows through automatically: Start pre-fills the stage-1 latent's audio rows, Pin re-pins the clean slice with mask 0 for stage 2. Without audio connected, the audio branch behaves as in the single shot.
+- The master lives in memory for this release: a restart re-runs the loop (per-chunk decode/save previews are still produced through Loop End's `images` branch). Disk checkpoints for the hires flow follow in a later release.
 
 ## Limitations
 

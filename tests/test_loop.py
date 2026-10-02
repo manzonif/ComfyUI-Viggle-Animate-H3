@@ -606,9 +606,9 @@ class LoopTests(unittest.TestCase):
                                   "ViggleChunkLoopEnd"})
         self.assertNotIn("ViggleAssembleChunkLatents", copied)  # downstream of End: not in the loop
         end_links = out["result"]
-        self.assertEqual(len(end_links), 2)
+        self.assertEqual(len(end_links), 3)
         self.assertEqual({link[0] for link in end_links}, {end_links[0][0]})
-        self.assertEqual([link[1] for link in end_links], [0, 1])
+        self.assertEqual([link[1] for link in end_links], [0, 1, 2])
         self.assertEqual(expanded[end_links[0][0]]["class_type"], "ViggleChunkLoopEnd")
         start_copy = [info for info in expanded.values() if info["class_type"] == "ViggleChunkLoopStart"][0]
         self.assertIn("initial_state", start_copy["inputs"])
@@ -625,10 +625,11 @@ class LoopTests(unittest.TestCase):
                 raise AssertionError("must not expand when done")
 
         end = loop.ViggleChunkLoopEnd()
-        collection, status = end.finish(["s", 0], state, torch.ones(1, 8, 8, 3),
-                                        dynprompt=FakeDynPrompt(), unique_id="e")
+        collection, status, master = end.finish(["s", 0], state, torch.ones(1, 8, 8, 3),
+                                                dynprompt=FakeDynPrompt(), unique_id="e")
         self.assertEqual(collection["run_name"], "done_run")
         self.assertIn("Completed", status)
+        self.assertIsNone(master)  # legacy state carries no hires master
         with self.assertRaises(ValueError):
             end.finish(["s", 0], state, torch.full((1, 8, 8, 3), float("nan")),
                        dynprompt=FakeDynPrompt(), unique_id="e")

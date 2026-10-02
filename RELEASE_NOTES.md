@@ -1,3 +1,20 @@
+# v1.3.4 — Two-stage hires extend loop
+
+Three new nodes replicate the single-shot two-stage recipe — 1 step at low resolution, latent upscale, then 4 steps at high resolution with a second model/LoRA stack — inside the chunked loop, while leaving the actual sampling to ComfyUI's **native `SamplerCustomAdvanced`**. The user keeps full control of both model stacks, the upscaler and the sigma split (`SplitSigmas` etc.); the new nodes only add the per-chunk machinery.
+
+- **Viggle Hires Chunk Start** (loop start, `sampling/viggle/experimental`): per-chunk `noise` (seed + chunk index, with `rerender_chunk`/`rerender_seed` override), the window's empty AV `latent` at the plan canvas (stage 1), the chunk's `conditioning` (connect to both guiders), plus `loop`/`state`. If the windowed conditioning has a driving audio connected, its clean slice is pre-filled into the latent's audio rows.
+- **Viggle Hires Chunk Pin**: sits between the AV concat (upscaled video + audio) and the high-res `SamplerCustomAdvanced`. It writes the previous chunk's high-res tail (the overlapping latents) at the front of the window, pins the driving audio's clean slice into the audio rows (denoise mask 0), and hands the nested denoise mask to the native sampler through `latent["noise_mask"]`. The first chunk passes through unmodified, so chunk 1 is exactly the single-shot workflow.
+- **Viggle Hires Chunk Store**: collects the high-res window into an in-memory master (overwriting the overlap), keeps the tail for the next carry and forwards the state to the existing **Viggle Chunk Loop End**.
+- **Viggle Chunk Loop End** gains a third output, `master` (LATENT): the assembled high-res nested AV latent when the loop completes — feed it to a normal VAE Decode. Legacy loop states return `None` there, so existing graphs are unchanged.
+
+Notes:
+
+- The final canvas is defined by **your upscaler** and must be identical for every chunk (the nodes validate this). Stage 1 runs at the plan canvas (the windowed conditioning's `width`/`height`). To use high-res references later, move the conditioning to the high-res canvas while stage 1 stays at the low canvas.
+- The master is in memory in this release (as in `Viggle Chunked Sampler`); per-chunk decode/save still runs through the Loop End `images` branch. Disk checkpoints for the hires flow follow in a later release.
+- `rerender_chunk`/`rerender_seed` re-runs the whole chain with a different seed for that chunk only; earlier chunks reproduce with their unchanged seeds (the master is in memory, so the carry rebuilds from scratch).
+
+Validation: 16 new tests (unit plus a full executor-level loop driving two native `SamplerCustomAdvanced` stages, covering per-chunk seeds, carry placement, mask contents, clean-audio passthrough, master assembly and the terminal master output). The existing 47 tests are unchanged except two Loop End tests, which now also cover the new output.
+
 # v1.3.3 — Lip-sync from the driving audio
 
 The H3 authors note that lip-sync improves when the model receives the driving clip's audio as a real soundtrack, encoded with the audio VAE and held as a clean latent in the target audio rows for the whole denoise. This release wires that up for the windowed and loop paths: previously the audio rows were always empty, so the model generated a throwaway track and the mouth had nothing to follow.

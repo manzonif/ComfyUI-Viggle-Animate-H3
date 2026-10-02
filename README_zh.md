@@ -20,6 +20,15 @@
 
 也就是说，4-step 并不代表 4 次模型推理，而是 4 个 sigma 点，其中最后一个 `0.0` 是轨迹终点，因此实际只执行 3 次 forward。
 
+## 1.3.4 更新
+
+- **两段式高清扩写循环**：三个新节点让分块循环可以执行单段 2 阶段方案 —— 低分辨率 1 步 → 3D 潜变量上采样 → 高分辨率 4 步（第二套模型/LoRA）—— 两个阶段都用**原生 `SamplerCustomAdvanced`** 采样，模型栈、上采样器和 sigma 切分完全由你自己控制：
+  - **Viggle Hires Chunk Start**：每块的 `noise`（seed + 块序号）、该窗口在计划画布上的空 AV `latent`（第一阶段）、该块的 `conditioning`（接到两个 guider）以及循环状态。
+  - **Viggle Hires Chunk Pin**：接在你的 AV 拼接之后、高分辨率采样器之前 —— 把上一块的高清尾部写到窗口开头（去噪掩码 0），并把驱动音频的干净行钉住（掩码 0）。第一块完全直通，与单段工作流一致。
+  - **Viggle Hires Chunk Store**：把高清窗口拼进内存中的 master（重叠区域覆盖），保留尾部供下一块携带，状态交给现有 **Viggle Chunk Loop End**；End 新增第三个输出 `master`（LATENT，嵌套 AV），完成后直接 VAE Decode。
+
+  最终画布由你的上采样器决定（每块必须一致，节点会校验）；第一阶段保持在条件画布（约 1.2 MP）。高清流的磁盘检查点将在后续版本加入。详情：[docs/long_video_guide_zh.md](docs/long_video_guide_zh.md)。
+
 ## 1.3.3 更新
 
 - **驱动音频口型同步**：**Viggle-Animate Conditioning (H3, Windowed)** 新增可选 `audio`、`audio_vae` 和 `fps` 输入。接入驱动视频自己的音轨和 MiniMax-H3 **音频 VAE** 后，整段音频只编码一次，其潜变量在整个去噪过程中作为**干净条件**保留在目标音频行里，嘴部跟随真实台词，而不是模型自己生成又被丢弃的音轨。
@@ -298,6 +307,33 @@ Loop Start ─ loop ────────────────────
 - Sample Chunk 根据种子在内部生成标准噪声，不再提供 noise 输入；更新旧工作流时请移除旧 noise 连线。通过连线提供模型文件名时，会保守检查该模型类别下的文件元数据，因此同类别其他文件的变化也可能使恢复失效。代码更新会使自动恢复失效，但旧潜变量文件仍可读取。
 - Sample Chunk 的只读 `live_progress` 文本框会实时显示每块的采样、恢复和解码/保存进度，无需额外节点或连线。更新后请重启 ComfyUI 并刷新浏览器。“循环完成”不代表下游最终拼接、解码和保存已完成；Start、End 和 Assemble 保留 STRING 状态输出。
 - 每块解码及保存完成后，才开始采样下一块。ComfyUI 执行缓存可能在内存中保留各块图像（124 帧、1024×576、float32 RGB 每块约 0.82 GiB）。要永久保存预览视频，请打开 Video Combine 的 `save_output`；潜变量检查点独立保存。
+
+### 两段式高清扩写循环（1.3.4 新增）
+
+单段 2 阶段方案（约 1.2 MP 跑 1 步 → 3D 潜变量上采样 → 高分辨率跑 4 步、换第二套模型/LoRA）现在可以在分块循环里逐块执行，且采样仍由**原生 `SamplerCustomAdvanced`** 完成。你现有的 `Separate AV Latent` → 上采样器 → `Concat AV Latent` 链原样保留在两个采样器之间：
+
+| 节点 | 作用 |
+|---|---|
+| **Viggle Hires Chunk Start** | 循环起点：每块 `noise`（seed + 序号）、窗口在计划画布上的空 AV `latent`（第一阶段）、该块 `conditioning`（接两个 guider）、`loop`/`state`。`rerender_chunk`/`rerender_seed` 覆盖某一块的种子。 |
+| **Viggle Hires Chunk Pin** | 接收 AV 拼接输出（或上采样器的纯视频输出），把上一块的高清尾部写入窗口开头，并构建嵌套去噪掩码（carry 区域为 0，干净驱动音频行为 0）。第一块：完全直通。 |
+| **Viggle Hires Chunk Store** | 把高清窗口写入内存 master（重叠区域覆盖），保留尾部供下一块携带，状态传给 Loop End；同时输出当前 `master` LATENT。 |
+
+```text
+Hires Start ─ noise ───────────────────────┬───────────────────────┐
+  ├ latent ─▶ [音频锁定节点, 可选] ────▶ SamplerCustomAdvanced #1（低清, 1 步）
+  ├ conditioning ─▶ 两个 Basic Guider   │                            │ denoised_output
+  └ state ─────────────────────────────▶ Pin                         ▼
+                                              ▲              Separate AV Latent ─┬ video ─▶ [你的 3D 潜变量上采样器]
+                                              └──────────────────────────────────┘ audio ─▶ Concat AV Latent
+Pin ─ latent（carry + 掩码）─▶ SamplerCustomAdvanced #2（高清, 4 步）
+                                   │ output ─▶ Store ◀── Pin 状态
+Store ─ chunk ─▶ Chunk Loop End ◀── loop（Start）+ images（逐块 VAE Decode / SaveWEBM）
+Store/Loop End ─ master（最终）─▶ VAE Decode ─▶ 成片
+```
+
+- Start 的 `conditioning` 接**两个** guider，`noise` 接**两个**采样器（两个阶段共享该块噪声，与单段一致）。最终画布 = 你的上采样器输出，每块必须一致（节点会校验）。
+- 1.3.3 的干净驱动音频自动贯穿：Start 预填第一阶段潜变量的音频行，Pin 在第二阶段用掩码 0 钉住干净切片；未接音频时与单段行为一致。
+- 本版本 master 在内存中：重启动会重跑循环（逐块解码/保存预览仍通过 Loop End 的 `images` 分支产生）；高清流的磁盘检查点将在后续版本加入。
 
 ## 已知局限
 

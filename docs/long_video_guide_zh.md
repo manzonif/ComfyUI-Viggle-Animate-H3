@@ -115,3 +115,36 @@ STRING 可接 Show Text，但循环展开后可能只显示某次迭代；实时
 ### 1.3.2 续接模式
 
 默认 `five_frame_anchor` 使用 5 帧解码/重新编码的锚点；124 帧窗口正常前进 119 帧，最后一个窗口完整对齐结尾。额外重叠不会覆盖已接受的输出。`latent_overlap` 保留旧行为用于对比。高级循环需将 H3 VAE 接到 Sample Chunk，更新后的示例已接好。重启 ComfyUI 并刷新浏览器后测试。
+
+### 1.3.4 两段式高清扩写循环
+
+单段 2 阶段方案（低清 1 步 → 3D 潜变量上采样 → 高清 4 步、第二套模型/LoRA）现在可以逐块执行，采样仍由**你自己的原生 `SamplerCustomAdvanced`** 完成。三个新节点（`sampling/viggle/experimental`）：
+
+| 节点 | 作用与接线 |
+|---|---|
+| Viggle Hires Chunk Start | 循环起点：`cond_set` 接 Windowed Conditioning；`seed` 为第一块种子（第 N 块 = `seed + N − 1`），`rerender_chunk`/`rerender_seed` 覆盖某一块。输出 `loop`（接 End）、`state`、`noise`（接**两个**采样器）、`conditioning`（接**两个** guider）、`latent`（计划画布上的窗口空 AV 潜变量，接第一阶段采样器，中间可插音频锁定节点）、`status` |
+| Viggle Hires Chunk Pin | 接在你的 `Concat AV Latent` 之后、高清采样器之前（也接受上采样器的纯视频输出）：把上一块的高清尾部写入窗口开头、钉住干净驱动音频行，把嵌套去噪掩码放进 `latent["noise_mask"]`，由原生采样器自动读取。第一块完全直通，与单段工作流一致 |
+| Viggle Hires Chunk Store | 接高清采样器 `output` 与 Pin 状态：把窗口写入内存 master（重叠区域覆盖）、保留尾部供下一块、`chunk` 接 End；同时输出当前 `master` LATENT |
+
+**Viggle Chunk Loop End** 现在接受 Hires Start 的 `loop`，并新增第三个输出 `master`（LATENT）：循环完成时输出拼接好的嵌套 AV 高清 master，直接接普通 VAE Decode 得到成片（旧循环状态该输出为 None）。逐块解码/保存仍走 `images` 分支（第二阶段窗口 VAE Decode → SaveWEBM/Video Combine → `after_save`）。
+
+```text
+Hires Start ─ noise ───────────────────────┬───────────────────────┐
+  ├ latent ─▶ [音频锁定节点, 可选] ────▶ SamplerCustomAdvanced #1（低清, 1 步）
+  ├ conditioning ─▶ 两个 Basic Guider   │                            │ denoised_output
+  └ state ─────────────────────────────▶ Pin                         ▼
+                                              ▲              Separate AV Latent ─┬ video ─▶ [你的 3D 潜变量上采样器]
+                                              └──────────────────────────────────┘ audio ─▶ Concat AV Latent
+Pin ─ latent（carry + 掩码）─▶ SamplerCustomAdvanced #2（高清, 4 步）
+                                   │ output ─▶ Store ◀── Pin 状态
+Store ─ chunk ─▶ Chunk Loop End ◀── loop（Start）+ images（逐块 VAE Decode / SaveWEBM）
+Store/Loop End ─ master（最终）─▶ VAE Decode ─▶ 成片
+```
+
+要点与限制：
+
+- sigma 切分用你自己的节点（例如 KJNodes `SplitSigmas`，`skip = 1`）：低清段取前 2 个点（1 步），高清段取其余 4 步。第二阶段收到的是 `denoised_output`（切分点处的 x0 估计）上采样后的潜变量，语义与单段一致（作为 x0 锚点重新加噪，而非严格续接）。
+- 第一阶段画布 = 计划画布（条件节点 `width`/`height`）；最终画布由你的上采样器决定，每块必须一致（节点会校验）。以后想用高清参考图，把条件节点移到高清画布即可，第一阶段保持低清。
+- 1.3.3 的驱动音频自动贯穿：Start 预填第一阶段音频行，Pin 在第二阶段用掩码 0 钉住干净切片；未接音频时与单段行为一致。
+- 本版本 master 在内存中：重启会重跑循环（逐块预览仍会生成）；高清流的磁盘检查点将在后续版本加入。`rerender_chunk`/`rerender_seed` 重跑整条链，仅该块换种子，前面的块以相同种子复现。
+- 测试前把种子控件设为固定值（`fixed`），否则每次排队换种子，逐块结果无法对照。
