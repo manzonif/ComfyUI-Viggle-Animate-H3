@@ -148,3 +148,4 @@ Store/Loop End ─ master（最终）─▶ VAE Decode ─▶ 成片
 - 1.3.3 的驱动音频自动贯穿：Start 预填第一阶段音频行，Pin 在第二阶段用掩码 0 钉住干净切片；未接音频时与单段行为一致。
 - 本版本 master 在内存中：重启会重跑循环（逐块预览仍会生成）；高清流的磁盘检查点将在后续版本加入。`rerender_chunk`/`rerender_seed` 重跑整条链，仅该块换种子，前面的块以相同种子复现。
 - 测试前把种子控件设为固定值（`fixed`），否则每次排队换种子，逐块结果无法对照。
+- **本流程不用 `Viggle Assemble Chunk Latents`**：它拼接的是旧循环的磁盘检查点；高清集合里没有 `run_name`，节点现在会明确提示。从旧循环工作流改造时，断开 Assemble 连线，改接 Loop End 的 `master` 输出到最终 VAE Decode。

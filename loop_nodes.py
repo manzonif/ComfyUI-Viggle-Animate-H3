@@ -319,6 +319,7 @@ class ViggleHiresChunkStart:
         if cond_a is not None:
             audio = cond_a[..., a0:a1].to(device=dev, dtype=torch.float32)
         status = f"Chunk {i + 1} of {len(spans)}: frames {a}-{b}, seed {seed_i} (stage 1: {ch}x{cw})"
+        logging.info("[ViggleHiresChunkStart] %s", status)
         _send_progress(dynprompt.get_display_node_id(unique_id), status)
         return ("loop", state, core_sampler.Noise_RandomNoise(seed_i), cond_set["conds"][i],
                 {"samples": NestedTensor((video, audio)), "latent_format_version_0": torch.empty(0)}, status)
@@ -392,9 +393,10 @@ class ViggleHiresChunkPin:
         out["samples"] = NestedTensor((video, audio))
         if mask is not None:
             out["noise_mask"] = mask
-        _send_progress(dynprompt.get_display_node_id(unique_id),
-                       f"Chunk {i + 1} of {len(plan['spans'])}: pinned {carry} carry latents at "
-                       f"{video.shape[3]}x{video.shape[4]}" + (", clean audio" if audio_clean else ""))
+        pin_status = (f"Chunk {i + 1} of {len(plan['spans'])}: pinned {carry} carry latents at "
+                      f"{video.shape[3]}x{video.shape[4]}" + (", clean audio" if audio_clean else ""))
+        logging.info("[ViggleHiresChunkPin] %s", pin_status)
+        _send_progress(dynprompt.get_display_node_id(unique_id), pin_status)
         return (out, state)
 
 
@@ -453,6 +455,7 @@ class ViggleHiresChunkStore:
         entries = state["entries"] + [{"span": [a, b, lat0, latn]}]
         status = (f"Chunk {i + 1} of {len(spans)} stored: master "
                   f"{master_v.shape[2]}x{video.shape[3]}x{video.shape[4]}")
+        logging.info("[ViggleHiresChunkStore] %s", status)
         _send_progress(dynprompt.get_display_node_id(unique_id), status)
         next_state = {**state, "index": i + 1, "entries": entries, "previous": previous,
                       "master_v": master_v, "master_a": master_a}
@@ -556,6 +559,10 @@ class ViggleAssembleChunkLatents:
     def assemble(self, run_name, chunk_number, chunks=None):
         if chunks is None:
             chunks = json.loads((_run_dir(run_name) / "manifest.json").read_text(encoding="utf-8"))
+        if "run_name" not in chunks:
+            raise ValueError("Viggle: this collection comes from the two-stage hires loop, which keeps "
+                             "its master in memory (no disk checkpoints). Use the Chunk Loop End's "
+                             "'master' LATENT output instead of this node.")
         directory = _run_dir(chunks["run_name"])
         entries = chunks["entries"]
         if chunks["version"] != CHECKPOINT_VERSION or not entries:

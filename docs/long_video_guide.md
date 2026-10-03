@@ -344,6 +344,12 @@ for the finished video; per-chunk decode/save still goes through the `images`
 branch (VAE Decode on the stage-2 window → SaveWEBM or Video Combine →
 `after_save`).
 
+**`Viggle Assemble Chunk Latents` is not part of this flow.** It stitches disk
+checkpoints from the legacy loop; the hires collection carries no `run_name`
+and the node now reports that explicitly. If you convert an existing loop
+workflow, drop the Assemble link and wire Loop End's `master` output to the
+final VAE Decode instead.
+
 ### Semantics and limits
 
 - **Stage-2 input is an x0 anchor, not a strict continuation.** Stage 1's `denoised_output` (the x0 estimate at the split sigma) is upsampled and fed to stage 2 as `latent_image`; with sigmas starting at the split point the flow `noise_scaling` re-noises it as an anchor — the same semantics as the single shot.

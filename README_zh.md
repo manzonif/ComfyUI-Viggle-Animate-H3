@@ -334,6 +334,7 @@ Store/Loop End ─ master（最终）─▶ VAE Decode ─▶ 成片
 - Start 的 `conditioning` 接**两个** guider，`noise` 接**两个**采样器（两个阶段共享该块噪声，与单段一致）。最终画布 = 你的上采样器输出，每块必须一致（节点会校验）。
 - 1.3.3 的干净驱动音频自动贯穿：Start 预填第一阶段潜变量的音频行，Pin 在第二阶段用掩码 0 钉住干净切片；未接音频时与单段行为一致。
 - 本版本 master 在内存中：重启动会重跑循环（逐块解码/保存预览仍通过 Loop End 的 `images` 分支产生）；高清流的磁盘检查点将在后续版本加入。
+- **本流程不要用 `Viggle Assemble Chunk Latents`** —— 它属于磁盘检查点循环；成片取 Loop End 的 `master` 输出 → VAE Decode。（保留连线时，节点会给出明确提示而不是裸 `KeyError`。）
 
 ## 已知局限
 

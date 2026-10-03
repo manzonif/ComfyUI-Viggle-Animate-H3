@@ -301,6 +301,7 @@ Store/Loop End ─ master (final) ─▶ VAE Decode ─▶ finished video
 - Connect Start's `conditioning` to **both** guiders and Start's `noise` to **both** samplers (the stages share the chunk's noise, as in the single shot). The final canvas is whatever your upscaler emits and must be identical for every chunk — the nodes validate this.
 - The clean driving audio (1.3.3) flows through automatically: Start pre-fills the stage-1 latent's audio rows, Pin re-pins the clean slice with mask 0 for stage 2. Without audio connected, the audio branch behaves as in the single shot.
 - The master lives in memory for this release: a restart re-runs the loop (per-chunk decode/save previews are still produced through Loop End's `images` branch). Disk checkpoints for the hires flow follow in a later release.
+- **Do not use `Viggle Assemble Chunk Latents` in this flow** — it belongs to the disk-checkpoint loop. The final video comes from Loop End's `master` output → VAE Decode. (If you keep Assemble wired, it now reports this instead of a bare `KeyError`.)
 
 ## Limitations
 

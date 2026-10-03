@@ -309,6 +309,21 @@ class LoopEndMasterTests(unittest.TestCase):
                                                FakeDyn(), "17")
         self.assertIsNone(out[2])
 
+    def test_assemble_rejects_hires_collection_with_hint(self):
+        # The hires terminal collection has no run_name (master lives in memory);
+        # a legacy Assemble node wired to it must explain itself, not KeyError.
+        plan = make_plan()
+        spans = plan["spans"]
+        state = {"plan": plan, "index": len(spans),
+                 "entries": [{"span": list(s)} for s in spans],
+                 "master_v": torch.zeros(1, 24, spans[-1][2] + spans[-1][3], 8, 8),
+                 "master_a": torch.zeros(1, 32, 2, round(plan["total_frames"] / FPS * AUDIO_FPS)),
+                 "previous": None}
+        collection, _, _ = loop.ViggleChunkLoopEnd().finish(
+            ("6", 0), state, torch.ones(1, 8, 8, 3), FakeDyn(), "17")
+        with self.assertRaisesRegex(ValueError, "master"):
+            loop.ViggleAssembleChunkLatents().assemble("viggle_x", 0, chunks=collection)
+
 
 class FakeSeparate:
     RETURN_TYPES = ("LATENT", "LATENT")
