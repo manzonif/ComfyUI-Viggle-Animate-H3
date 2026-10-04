@@ -133,6 +133,66 @@ class ViggleTextCondLoader:
                  "text_token_tags": blob["text_token_tags"]},)
 
 
+class ViggleTextCondExtend:
+    """Optionally appends CLIP-encoded text to the frozen text conditioning.
+
+    The frozen file is a fixed 362-token Qwen3-VL-32B (layer 50, unnormalized)
+    embedding of the finetune's fixed prompt — one global sequence, not
+    per-frame. The H3 DiT consumes variable-length text (condition_proj +
+    token_refiner + attention), so extra tokens produced by the SAME encoder
+    (CLIPLoader type 'minimax', the clip file your H3 workflow already uses)
+    can be concatenated behind the frozen ones. The model has only been
+    finetuned on the 362-token presentation, so treat extensions as
+    experimental and A/B them against the stock prompt.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "text_cond": ("TEXT_COND", {"tooltip": "From Load Text Conditioning (Viggle)."}),
+        }, "optional": {
+            "clip": ("CLIP", {"tooltip": "CLIPLoader type 'minimax' — the Qwen3-VL-32B encoder that produced the frozen file."}),
+            "append_text": ("STRING", {"default": "", "multiline": True,
+                                       "tooltip": "Extra prompt (clothing, style, action...), appended after the frozen one. Empty = passthrough."}),
+            "replace_frozen": ("BOOLEAN", {"default": False,
+                                           "tooltip": "Drop the frozen 362 tokens and use only the encoded text. Farther from the finetune's distribution — experimental."}),
+        }}
+
+    RETURN_TYPES = ("TEXT_COND",)
+    RETURN_NAMES = ("text_cond",)
+    FUNCTION = "extend"
+    CATEGORY = "loaders/viggle"
+    DESCRIPTION = "Append (or replace) CLIP-encoded text on the frozen text conditioning."
+
+    def extend(self, text_cond, clip=None, append_text="", replace_frozen=False):
+        base = text_cond["prompt_embeds"]
+        tags = text_cond["text_token_tags"]
+        text = (append_text or "").strip()
+        if not text and not replace_frozen:
+            return (text_cond,)
+        if not text:
+            return (text_cond,)
+        if clip is None:
+            raise ValueError("Viggle Text Cond Extend: connect a CLIP (CLIPLoader type 'minimax') to encode text.")
+        tokens = clip.tokenize(text)
+        out = clip.encode_from_tokens_scheduled(tokens)
+        pair = out[0]
+        new_embeds = pair[0]
+        pooled = pair[1] if len(pair) > 1 else {}
+        new_tags = pooled.get("minimax_token_tags")
+        if new_tags is None:  # pure text presentation: every position is text
+            new_tags = torch.ones(new_embeds.shape[1], dtype=torch.int64)
+        if new_embeds.shape[-1] != base.shape[-1]:
+            raise ValueError(f"Viggle Text Cond Extend: encoder dimension {new_embeds.shape[-1]} does not match the frozen "
+                             f"conditioning dimension {base.shape[-1]}. Use the H3 model's own clip (CLIPLoader type 'minimax').")
+        new_embeds = new_embeds.to(base.device, base.dtype).contiguous()
+        new_tags = new_tags.to(tags.device, tags.dtype).view(-1)
+        if replace_frozen:
+            return ({"prompt_embeds": new_embeds, "text_token_tags": new_tags},)
+        return ({"prompt_embeds": torch.cat([base, new_embeds], dim=1),
+                 "text_token_tags": torch.cat([tags, new_tags], dim=0)},)
+
+
 class ViggleAnimateConditioning:
     """Viggle-Animate (MiniMax-H3 ref2va finetune) conditioning.
 
@@ -780,10 +840,12 @@ class ViggleChunkedSampler:
 
 
 NODE_CLASS_MAPPINGS = {"ViggleTextCondLoader": ViggleTextCondLoader,
+                       "ViggleTextCondExtend": ViggleTextCondExtend,
                        "ViggleAnimateConditioning": ViggleAnimateConditioning,
                        "ViggleAnimateConditioningWindowed": ViggleAnimateConditioningWindowed,
                        "ViggleChunkedSampler": ViggleChunkedSampler}
 NODE_DISPLAY_NAME_MAPPINGS = {"ViggleTextCondLoader": "Load Text Conditioning (Viggle)",
+                              "ViggleTextCondExtend": "Viggle Text Cond Extend",
                               "ViggleAnimateConditioning": "Viggle-Animate Conditioning (H3)",
                               "ViggleAnimateConditioningWindowed": "Viggle-Animate Conditioning (H3, Windowed)",
                               "ViggleChunkedSampler": "Viggle Chunked Sampler"}

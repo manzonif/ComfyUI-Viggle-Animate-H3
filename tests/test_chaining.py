@@ -653,5 +653,64 @@ class ChainingTests(unittest.TestCase):
             self.assertFalse(viggle._CHUNK_CACHE)
 
 
+class FakeTextClip:
+    """Duck-type of ComfyUI's CLIP object for the minimax (Qwen3-VL) encoder."""
+    def __init__(self, dim=5120, tokens=7, tags=None):
+        self.dim, self.n, self.tags = dim, tokens, tags
+        self.tokenized = None
+
+    def tokenize(self, text, **kwargs):
+        self.tokenized = text
+        return ("tokens:" + text,)
+
+    def encode_from_tokens_scheduled(self, tokens, **kwargs):
+        L = self.n
+        embeds = (torch.arange(L, dtype=torch.float32).view(1, L, 1)
+                  .expand(1, L, self.dim).contiguous().to(torch.bfloat16))
+        tags = self.tags if self.tags is not None else torch.ones(L, dtype=torch.int64)
+        return [[embeds, {"pooled_output": None, "minimax_token_tags": tags}]]
+
+
+class TextCondExtendTests(unittest.TestCase):
+    def _frozen(self):
+        return {"prompt_embeds": torch.full((1, 3, 5120), 1.0, dtype=torch.bfloat16),
+                "text_token_tags": torch.tensor([0, 1, 1], dtype=torch.int64)}
+
+    def test_empty_text_is_passthrough(self):
+        frozen = self._frozen()
+        out = viggle.ViggleTextCondExtend().extend(frozen)
+        self.assertIs(out[0], frozen)
+
+    def test_append_concatenates_embeds_and_tags(self):
+        frozen = self._frozen()
+        clip = FakeTextClip(tokens=7)
+        out = viggle.ViggleTextCondExtend().extend(frozen, clip=clip, append_text="a red jacket")
+        self.assertEqual(clip.tokenized, "a red jacket")
+        embeds, tags = out[0]["prompt_embeds"], out[0]["text_token_tags"]
+        self.assertEqual(tuple(embeds.shape), (1, 10, 5120))
+        self.assertEqual(embeds.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(embeds[0, :3], frozen["prompt_embeds"][0, :3]))
+        expected = (torch.arange(7, dtype=torch.float32).view(1, 7, 1)
+                    .expand(1, 7, 5120).contiguous().to(torch.bfloat16))
+        self.assertTrue(torch.equal(embeds[0, 3:], expected[0]))
+        self.assertTrue(torch.equal(tags, torch.tensor([0, 1, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.int64)))
+
+    def test_missing_clip_raises(self):
+        with self.assertRaisesRegex(ValueError, "CLIP"):
+            viggle.ViggleTextCondExtend().extend(self._frozen(), append_text="text")
+
+    def test_replace_drops_frozen(self):
+        out = viggle.ViggleTextCondExtend().extend(self._frozen(), clip=FakeTextClip(tokens=4),
+                                                   append_text="only this", replace_frozen=True)
+        embeds, tags = out[0]["prompt_embeds"], out[0]["text_token_tags"]
+        self.assertEqual(tuple(embeds.shape), (1, 4, 5120))
+        self.assertTrue(torch.equal(tags, torch.ones(4, dtype=torch.int64)))
+
+    def test_dimension_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "dimension"):
+            viggle.ViggleTextCondExtend().extend(self._frozen(), clip=FakeTextClip(dim=3584),
+                                                 append_text="text")
+
+
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0]], verbosity=2)

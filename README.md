@@ -51,6 +51,7 @@ for wiring, recovery and a first-run checklist.
 | Node | What it does |
 |---|---|
 | **Load Text Conditioning (Viggle)** | Dropdown loader for frozen text conditioning in `models/text_cond/` |
+| **Viggle Text Cond Extend** | Optionally appends (or replaces) CLIP-encoded text on the frozen conditioning — connect the H3 model's own clip (CLIPLoader type `minimax`); empty text = passthrough |
 | **Viggle-Animate Conditioning (H3)** | Builds conditioning + AV latent: video-first reference order, both references nested on the canvas short edge (the driving clip's, unless width/height are overridden) — the layout the finetune was trained with |
 | **Viggle-Animate Conditioning (H3, Windowed)** | Splits the driving clip into overlapping windows and builds each chunk's references; optionally encodes the driving soundtrack as clean target audio; outputs `cond_set` for the chunked sampler and `guider_positive` for the guider |
 | **Viggle Chunked Sampler** | Samples each window, preserves overlap from the preceding chunk, reuses eligible cached chunks, and decodes the assembled video; outputs `frames`, a readable `chunk_map` and the assembled `audio_latent` |

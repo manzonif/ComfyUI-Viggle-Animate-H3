@@ -1,3 +1,12 @@
+# v1.3.5 — Extend the frozen text conditioning
+
+The finetune ships a frozen 362-token text embedding (`fixed_embed_fwd_anyframe`): one global Qwen3-VL-32B (layer 50, unnormalized) sequence of the fixed prompt — not per-frame. The H3 DiT consumes variable-length text (learned projection + refiner + attention), so extra tokens from the same encoder can be appended to it.
+
+- **Viggle Text Cond Extend** (`loaders/viggle`): takes the frozen `TEXT_COND` plus an optional `CLIP` (CLIPLoader type `minimax` — the Qwen3-VL-32B encoder your H3 workflow already loads) and an `append_text` string. Empty text is a no-op passthrough, so existing graphs are unaffected. With `replace_frozen` the frozen 362 tokens are dropped and only the encoded text is used.
+- The node concatenates embeddings and modality tags (frozen first, appended text after), matching dtype/device, and rejects a clip with a different embedding dimension.
+
+Caveat: the finetune was evaluated on the exact 362-token presentation. Appending keeps the fixed prompt and adds context (clothing, style, action modifiers) and is the sane first experiment; replacing is farther from the trained distribution. A/B against the stock prompt before trusting either.
+
 # v1.3.4 — Two-stage hires extend loop
 
 Three new nodes replicate the single-shot two-stage recipe — 1 step at low resolution, latent upscale, then 4 steps at high resolution with a second model/LoRA stack — inside the chunked loop, while leaving the actual sampling to ComfyUI's **native `SamplerCustomAdvanced`**. The user keeps full control of both model stacks, the upscaler and the sigma split (`SplitSigmas` etc.); the new nodes only add the per-chunk machinery.

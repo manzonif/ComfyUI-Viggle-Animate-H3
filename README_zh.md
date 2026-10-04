@@ -56,6 +56,7 @@
 | 节点 | 功能 |
 |---|---|
 | **Load Text Conditioning (Viggle)** | 从 `models/text_cond/` 下拉加载冻结文本条件 |
+| **Viggle Text Cond Extend** | 在冻结条件上可选追加（或替换）CLIP 编码的文本 —— 接 H3 模型自带的 clip（CLIPLoader type `minimax`）；空文本 = 直通 |
 | **Viggle-Animate Conditioning (H3)** | 构建条件 + AV latent:视频优先的参考顺序,两个参考均按驱动视频短边嵌套 —— 即微调训练时使用的布局 |
 | **Viggle-Animate Conditioning (H3, Windowed)** | 将驱动视频划分为重叠窗口，并为每块构建参考条件；可选地将驱动音频编码为干净的目标音频潜变量；输出 `cond_set` 接分块采样器，`guider_positive` 接 guider |
 | **Viggle Chunked Sampler** | 逐块采样并保留上一块的重叠内容，复用符合条件的缓存，最后统一解码；输出视频帧 `frames`、分块信息 `chunk_map` 和拼接后的 `audio_latent` |

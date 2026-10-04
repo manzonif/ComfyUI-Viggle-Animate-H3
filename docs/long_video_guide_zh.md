@@ -23,6 +23,7 @@
 | 节点 | 作用与接线 |
 |---|---|
 | Load Text Conditioning | 加载固定文本条件，接条件节点的 `text_cond` |
+| Text Cond Extend | 在冻结文本条件上追加（或替换）文本：接 H3 自带的 clip（CLIPLoader type `minimax`）+ `append_text`；空文本直通；输出 TEXT_COND 接条件节点的 `text_cond` |
 | 原始 Conditioning (H3) | 单段生成的条件和 AV 潜变量，接普通采样流程 |
 | Windowed Conditioning | 分配重叠窗口并编码参考；`cond_set` 接 Start 或 Chunked Sampler，`guider_positive` 接 guider；可选的 `audio`/`audio_vae`/`fps` 将驱动音轨作为干净目标音频接入（口型同步） |
 | Chunked Sampler | 一个节点内采样所有块并最终解码；输出 `frames` 直接保存、`chunk_map` 查看种子和范围、`audio_latent` 为拼接后的音频潜变量；内部需要 VAE |
@@ -48,6 +49,9 @@ Sample Chunk 的 `filename_prefix` 是保存路径前缀，包含运行名、块
    输出也设为 24 fps。最终视频使用驱动音频并裁到保留的视频长度；不能直接拼接带重叠的预览视频。
    需要口型同步时，把驱动视频的音频接到 Windowed Conditioning 的 `audio`，
    并将 MiniMax-H3 音频 VAE 接到 `audio_vae`（非 24 fps 加载时才需改 `fps`）。
+   想改动文本条件时，在 Load Text Conditioning 和条件节点之间插入 Text Cond Extend：
+   接 H3 自带的 clip（CLIPLoader type `minimax`），在 `append_text` 里写追加文本（空 = 直通）；
+   finetune 只在固定 362 token 上评测过，追加/替换前先与原版 A/B 对照。
 6. Start 填一个新的 `run_name`，开启 `resume`；Sample Chunk 使用固定 `seed`，
    示例中的种子控制为 `randomize`，测试取消/恢复前请改为 `fixed`，否则每次排队都会换种子。
    `rerender_chunk = 0`。采样配置见 README 的 sigma 预设：四点基准配 Euler、CFG 1.0，
