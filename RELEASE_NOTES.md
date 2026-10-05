@@ -3,6 +3,7 @@
 The finetune ships a frozen 362-token text embedding (`fixed_embed_fwd_anyframe`): one global Qwen3-VL-32B (layer 50, unnormalized) sequence of the fixed prompt — not per-frame. The H3 DiT consumes variable-length text (learned projection + refiner + attention), so extra tokens from the same encoder can be appended to it.
 
 - **Viggle Text Cond Extend** (`loaders/viggle`): takes the frozen `TEXT_COND` plus an optional `CLIP` (CLIPLoader type `minimax` — the Qwen3-VL-32B encoder your H3 workflow already loads) and an `append_text` string. Empty text is a no-op passthrough, so existing graphs are unaffected. With `replace_frozen` the frozen 362 tokens are dropped and only the encoded text is used.
+- `strength` (default 1.0, range 0–2) scales the **appended** embeddings: below 1 attenuates the extra text, above 1 amplifies it, 0 drops it entirely (frozen passthrough). The frozen 362 tokens are never scaled. The extra tokens' influence is seed-sensitive, so dial the strength down (e.g. 0.5) when a full-weight append overpowers the finetune's behaviour.
 - The node concatenates embeddings and modality tags (frozen first, appended text after), matching dtype/device, and rejects a clip with a different embedding dimension.
 
 Caveat: the finetune was evaluated on the exact 362-token presentation. Appending keeps the fixed prompt and adds context (clothing, style, action modifiers) and is the sane first experiment; replacing is farther from the trained distribution. A/B against the stock prompt before trusting either.

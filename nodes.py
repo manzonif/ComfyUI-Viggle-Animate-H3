@@ -156,6 +156,8 @@ class ViggleTextCondExtend:
                                        "tooltip": "Extra prompt (clothing, style, action...), appended after the frozen one. Empty = passthrough."}),
             "replace_frozen": ("BOOLEAN", {"default": False,
                                            "tooltip": "Drop the frozen 362 tokens and use only the encoded text. Farther from the finetune's distribution — experimental."}),
+            "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01,
+                                   "tooltip": "Weight of the encoded text: 1.0 = full, below attenuates it, above amplifies it, 0 = ignore the text (frozen passthrough)."}),
         }}
 
     RETURN_TYPES = ("TEXT_COND",)
@@ -164,16 +166,18 @@ class ViggleTextCondExtend:
     CATEGORY = "loaders/viggle"
     DESCRIPTION = "Append (or replace) CLIP-encoded text on the frozen text conditioning."
 
-    def extend(self, text_cond, clip=None, append_text="", replace_frozen=False):
+    def extend(self, text_cond, clip=None, append_text="", replace_frozen=False, strength=1.0):
         base = text_cond["prompt_embeds"]
         tags = text_cond["text_token_tags"]
         text = (append_text or "").strip()
-        if not text and not replace_frozen:
-            return (text_cond,)
         if not text:
             return (text_cond,)
         if clip is None:
             raise ValueError("Viggle Text Cond Extend: connect a CLIP (CLIPLoader type 'minimax') to encode text.")
+        if strength <= 0.0:
+            if replace_frozen:
+                raise ValueError("Viggle Text Cond Extend: strength must be > 0 when replace_frozen is set.")
+            return (text_cond,)  # 0 = ignore the text, same as empty
         tokens = clip.tokenize(text)
         out = clip.encode_from_tokens_scheduled(tokens)
         pair = out[0]
@@ -185,7 +189,10 @@ class ViggleTextCondExtend:
         if new_embeds.shape[-1] != base.shape[-1]:
             raise ValueError(f"Viggle Text Cond Extend: encoder dimension {new_embeds.shape[-1]} does not match the frozen "
                              f"conditioning dimension {base.shape[-1]}. Use the H3 model's own clip (CLIPLoader type 'minimax').")
-        new_embeds = new_embeds.to(base.device, base.dtype).contiguous()
+        new_embeds = new_embeds.to(base.device, base.dtype)
+        if strength != 1.0:
+            new_embeds = new_embeds * strength
+        new_embeds = new_embeds.contiguous()
         new_tags = new_tags.to(tags.device, tags.dtype).view(-1)
         if replace_frozen:
             return ({"prompt_embeds": new_embeds, "text_token_tags": new_tags},)

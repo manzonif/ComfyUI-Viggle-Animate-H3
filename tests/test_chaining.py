@@ -711,6 +711,27 @@ class TextCondExtendTests(unittest.TestCase):
             viggle.ViggleTextCondExtend().extend(self._frozen(), clip=FakeTextClip(dim=3584),
                                                  append_text="text")
 
+    def test_strength_scales_only_new_embeds(self):
+        frozen = self._frozen()
+        out = viggle.ViggleTextCondExtend().extend(frozen, clip=FakeTextClip(tokens=4),
+                                                   append_text="x", strength=0.5)
+        embeds = out[0]["prompt_embeds"]
+        self.assertTrue(torch.equal(embeds[0, :3], frozen["prompt_embeds"][0, :3]))
+        expected = ((torch.arange(4, dtype=torch.float32) * 0.5).view(1, 4, 1)
+                    .expand(1, 4, 5120).contiguous().to(torch.bfloat16))
+        self.assertTrue(torch.allclose(embeds[0, 3:], expected[0], atol=0, rtol=0))
+
+    def test_strength_zero_is_passthrough(self):
+        frozen = self._frozen()
+        out = viggle.ViggleTextCondExtend().extend(frozen, clip=FakeTextClip(),
+                                                   append_text="x", strength=0.0)
+        self.assertIs(out[0], frozen)
+
+    def test_replace_with_zero_strength_raises(self):
+        with self.assertRaisesRegex(ValueError, "strength"):
+            viggle.ViggleTextCondExtend().extend(self._frozen(), clip=FakeTextClip(),
+                                                 append_text="x", replace_frozen=True, strength=0.0)
+
 
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0]], verbosity=2)
